@@ -1,0 +1,4 @@
+PyQt5==5.15.11
+zaber-motion==7.10.0
+pyserial==3.5
+pyusb==1.3.1
