@@ -12,7 +12,8 @@ echo " Python:  $PYTHON"
 echo ""
 
 # 1. ติดตั้ง dependencies
-echo "[1/3] Installing Python dependencies..."
+echo "[1/3] Installing dependencies..."
+sudo apt-get install -y sshpass tmux
 $PYTHON -m pip install -r "$PROJECT_DIR/requirements.txt"
 echo "      Done."
 echo ""
@@ -41,7 +42,7 @@ cat > "$DESKTOP_DIR/kcmh-trigger.desktop" <<EOF
 [Desktop Entry]
 Type=Application
 Name=KCMH Trigger
-Exec=$PROJECT_DIR/launch_app.sh
+Exec=bash -c '$PROJECT_DIR/launch_app.sh 2>&1 | tee /tmp/kcmh.log'
 Icon=$PROJECT_DIR/images/scan-eye.svg
 Terminal=false
 Categories=Utility;
@@ -53,7 +54,7 @@ cat > "$DESKTOP_DIR/kcmh-trigger-sim.desktop" <<EOF
 [Desktop Entry]
 Type=Application
 Name=KCMH Trigger (Sim)
-Exec=$PROJECT_DIR/launch_app.sh --sim
+Exec=bash -c '$PROJECT_DIR/launch_app.sh --sim 2>&1 | tee /tmp/kcmh-sim.log'
 Icon=$PROJECT_DIR/images/view.svg
 Terminal=false
 Categories=Utility;
