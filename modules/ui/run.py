@@ -3,7 +3,8 @@ from PyQt5.QtWidgets import (
     QWidget, QPushButton, QLineEdit, QApplication, QMainWindow,
     QVBoxLayout, QHBoxLayout, QFrame, QSpacerItem, QSizePolicy,
     QMessageBox, QFileDialog, QCheckBox, QInputDialog,
-    QLabel, QAction, qApp, QDialog, QGridLayout, QPlainTextEdit, QProgressBar, QToolButton
+    QLabel, QAction, qApp, QDialog, QGridLayout, QPlainTextEdit, QProgressBar, QToolButton,
+    QScrollArea
     )
 from PyQt5.QtCore import Qt, QRect, QSize, QMetaObject, Q_ARG, QTimer
 from PyQt5.QtCore import pyqtSlot
@@ -23,10 +24,27 @@ import modules.alpide as alpide
 import usb
 import time
 import threading
+import sys
+import io
+import psutil
+from datetime import datetime
 
-_ssh_password = None
-_ssh_password_time = None
-_SSH_PASSWORD_TTL = 6 * 3600  # 6 ชั่วโมง
+_ssh_password = None  # cached for session lifetime only
+
+
+class _TeeWriter:
+    """Write to both the original stdout and a StringIO buffer simultaneously."""
+    def __init__(self, original, buffer):
+        self._original = original
+        self._buffer = buffer
+    def write(self, s):
+        self._original.write(s)
+        self._buffer.write(s)
+    def flush(self):
+        self._original.flush()
+        self._buffer.flush()
+    def fileno(self):
+        return self._original.fileno()
 
 
 class EmbeddedTerminal(QWidget):
@@ -96,9 +114,11 @@ class RunWidget(QWidget):
         self._window = window
         self._run_type = 0
         self._pid = None
-        self._w = None 
+        self._w = None
         self._opened_file = None
         self._first_file = None
+        self._program_log_buffer = None
+        self._run_stats_start = None
         self._checks = [0, 0]
         self._connection_icons = [QIcon('./images/link-break-2.svg'), 
                                   QIcon('./images/link-2.svg')]
@@ -136,6 +156,10 @@ class RunWidget(QWidget):
         self._rsync_header_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
         self._rsync_header_label.setFixedHeight(36)
         self._rsync_header_label.setVisible(True)
+        self._rsync_header_label.setStyleSheet(
+            "QLabel { font-size: 11px; font-weight: bold; background: transparent; border: none; "
+            "padding: 3px 10px; font-family: monospace; color: rgba(255,255,255,0.35); }"
+        )
         self._connection = {"alpide": QPushButton(" ALPIDE"),
                             "zaber": QPushButton(" Zaber"),
                             "fpga": QPushButton(" FPGA")}
@@ -165,31 +189,28 @@ class RunWidget(QWidget):
 
         self._config_path = path.join(os.getcwd(), 'config.json')
         default_outpath = path.join(os.getcwd(), 'output')
-        default_rsync_dest = ''
+        default_rsync_address = ''
+        default_rsync_path = ''
         try:
             with open(self._config_path, 'r') as f:
                 _cfg = json.load(f)
                 default_outpath = _cfg.get('outpath', default_outpath)
-                default_rsync_dest = _cfg.get('rsync_dest', '')
+                default_rsync_address = _cfg.get('rsync_address', '')
+                default_rsync_path = _cfg.get('rsync_path', '')
         except (FileNotFoundError, json.JSONDecodeError):
             pass
         self._outpath_label = QLabel(default_outpath)
         self._outpath_btn = QPushButton("output")
         self._outpath_btn.clicked.connect(self.chooseOutpath)
-        self._rsync_label = QLabel(default_rsync_dest if default_rsync_dest else "rsync destination not set")
-        self._rsync_btn = QPushButton("rsync")
-        self._rsync_btn.clicked.connect(self.chooseRsyncDest)
-        _rsync_no_password = False
-        try:
-            with open(self._config_path, 'r') as f:
-                _rsync_no_password = json.load(f).get('rsync_no_password', False)
-        except (FileNotFoundError, json.JSONDecodeError):
-            pass
-        self._rsync_nopass_check = QCheckBox("SSH key")
-        self._rsync_nopass_check.setChecked(_rsync_no_password)
-        self._rsync_nopass_check.stateChanged.connect(self._save_rsync_nopass)
+        self._rsync_addr_edit = QLineEdit(default_rsync_address)
+        self._rsync_addr_edit.setPlaceholderText("user@host")
+        self._rsync_path_edit = QLineEdit(default_rsync_path)
+        self._rsync_path_edit.setPlaceholderText("/path/to/folder")
+        self._rsync_connect_btn = QPushButton("Connect")
+        self._rsync_connect_btn.clicked.connect(self._rsync_connect)
         self._rsync_status_label = QLabel("")
         self._rsync_status_label.setStyleSheet("QLabel{ font-size: 12px; color: #8898a8; font-family: monospace; }")
+        self._rsync_toast = None
         self._current_file = None
         self._launch_eudaq_default = QPushButton("Launch default")
         self._launch_eudaq_default.setEnabled(False)
@@ -370,22 +391,46 @@ class RunWidget(QWidget):
         # self._line_edits["Y step (mm)"].setToolTip("")
         # self._line_edits["R step (degree)"].setToolTip("")
         self._top_widget = QFrame()
-        # self._top_widget.setStyleSheet("""
-        # QFrame {
-        #     border: 2px solid rgba(0, 0, 0, 0.1);
-        #     border-radius: 10px;
-        # }
-        # """)
         self._bottom_widget = QFrame()
-        # self._bottom_widget.setStyleSheet("""
-        # QFrame {
-        #     border: 2px solid rgba(0, 0, 0, 0.1);
-        #     border-radius: 10px;
-        # }
-        # QLabel {
-        #     border: 0;
-        # }
-        # """)
+
+        # ── Notification history ─────────────────────────────────────────
+        self._notifications = []   # list of dicts {time, title, message, icon_color}
+        self._unread_count = 0
+        self._notif_panel = None   # created lazily
+
+        # Bell button
+        self._bell_btn = QPushButton("🔔")
+        self._bell_btn.setFixedSize(36, 36)
+        self._bell_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        self._bell_btn.setToolTip("Notification history")
+        self._bell_btn.setStyleSheet("""
+            QPushButton {
+                font-size: 17px;
+                background-color: rgba(255,255,255,0.08);
+                border: 1px solid rgba(255,255,255,0.18);
+                border-radius: 7px;
+                color: #ffffff;
+            }
+            QPushButton:hover { background-color: rgba(255,255,255,0.18); }
+            QPushButton:pressed { background-color: rgba(255,255,255,0.06); }
+        """)
+        self._bell_btn.clicked.connect(self._toggle_notification_panel)
+
+        # Badge label (positioned as sibling inside a container QFrame)
+        self._bell_badge = QLabel("")
+        self._bell_badge.setAlignment(Qt.AlignCenter)
+        self._bell_badge.setFixedSize(16, 16)
+        self._bell_badge.setVisible(False)
+        self._bell_badge.setStyleSheet("""
+            QLabel {
+                background-color: #ff4757;
+                color: #ffffff;
+                font-size: 9px;
+                font-weight: bold;
+                border-radius: 8px;
+                border: 1px solid #1e3a5f;
+            }
+        """)
         self.init_ui()
         # poll firmware status ทุก 2 วินาที
         self._firmware_timer = QTimer(self)
@@ -505,6 +550,17 @@ class RunWidget(QWidget):
         status_box_layout.addWidget(self._rsync_header_label)
         header_layout.addWidget(status_box)
 
+        # Bell button container (button + overlaid badge)
+        bell_wrap = QFrame()
+        bell_wrap.setFixedSize(44, 38)
+        bell_wrap.setStyleSheet("QFrame { background: transparent; border: none; }")
+        self._bell_btn.setParent(bell_wrap)
+        self._bell_btn.setGeometry(0, 1, 36, 36)
+        self._bell_badge.setParent(bell_wrap)
+        self._bell_badge.setGeometry(24, 0, 16, 16)
+        self._bell_badge.raise_()
+        header_layout.addWidget(bell_wrap)
+
         self._top_widget.setStyleSheet("""
             QFrame {
                 background-color: #1e3a5f;
@@ -542,153 +598,124 @@ class RunWidget(QWidget):
 
         ph_inner = QWidget()
         ph_inner_layout = QVBoxLayout(ph_inner)
-        ph_inner_layout.setContentsMargins(10, 6, 10, 4)
+        ph_inner_layout.setContentsMargins(10, 6, 10, 8)
         ph_inner_layout.setSpacing(4)
 
-        # position labels (current)
+        # hidden compat labels — run_progress reads .text()
         self._ph_x_label = QLabel(self._window.orig_loc[0])
         self._ph_y_label = QLabel(self._window.orig_loc[1])
         self._ph_r_label = QLabel(self._window.orig_loc[2])
+        for lbl in [self._ph_x_label, self._ph_y_label, self._ph_r_label]:
+            lbl.setVisible(False)
+            ph_inner_layout.addWidget(lbl)
 
-        # step inputs
+        # hidden step edits — default "1", used by _ph_step()
         self._x_step_edit = QLineEdit("1")
         self._y_step_edit = QLineEdit("1")
         self._r_step_edit = QLineEdit("1")
         for e in [self._x_step_edit, self._y_step_edit, self._r_step_edit]:
-            e.setFixedWidth(44)
-            e.setAlignment(Qt.AlignmentFlag.AlignCenter)
-            e.setStyleSheet("QLineEdit { font-size: 12px; border: 1px solid #c0cfe0; border-radius: 4px; padding: 2px 4px; }")
+            e.setVisible(False)
 
-        # position edit inputs
+        # Go to edit inputs
         self._ph_x_edit_ctrl = QLineEdit(self._window.orig_loc[0])
         self._ph_y_edit_ctrl = QLineEdit(self._window.orig_loc[1])
         self._ph_r_edit_ctrl = QLineEdit(self._window.orig_loc[2])
-        for e in [self._ph_x_edit_ctrl, self._ph_y_edit_ctrl, self._ph_r_edit_ctrl]:
-            e.setFixedWidth(58)
-            e.setAlignment(Qt.AlignmentFlag.AlignCenter)
-            e.setStyleSheet("QLineEdit { font-size: 12px; font-weight: bold; border: 1px solid #c0cfe0; border-radius: 4px; padding: 2px 4px; }")
         self._ph_x_edit_ctrl.textChanged.connect(lambda: self._ph_change_line_edit(0))
         self._ph_y_edit_ctrl.textChanged.connect(lambda: self._ph_change_line_edit(1))
         self._ph_r_edit_ctrl.textChanged.connect(lambda: self._ph_change_line_edit(2))
 
-        # direction buttons helper
-        def _ph_btn(icon_name):
-            b = QToolButton()
-            b.setIcon(QIcon(f"./images/{icon_name}.svg"))
-            b.setIconSize(QSize(20, 20))
-            b.setFixedSize(36, 36)
-            b.setStyleSheet("""
-                QToolButton { background: #ffffff; border: 1px solid #bcc8d8; border-radius: 6px; }
-                QToolButton:hover { background: #e3eaf5; border-color: #1565C0; }
-                QToolButton:pressed { background: #c8d8ec; }
-            """)
-            return b
-
-        # hidden labels — kept for compat (_show_progress_section / run_progress reads .text())
-        for lbl in [self._ph_x_label, self._ph_y_label, self._ph_r_label]:
-            lbl.setVisible(False)
-            ph_inner_layout.addWidget(lbl)
-        # step edits hidden — default "1", still used by _ph_step()
-        for e in [self._x_step_edit, self._y_step_edit, self._r_step_edit]:
-            e.setVisible(False)
-
         _axis_lbl_style = "QLabel { font-size: 12px; font-weight: bold; color: #1e2d3d; border: none; min-width: 14px; }"
         _unit_lbl_style = "QLabel { font-size: 11px; color: #4a6078; border: none; }"
-        _disp_style     = ("QLabel { font-size: 13px; font-weight: bold; font-family: monospace;"
-                           " color: #1565C0; background: #f4f7fb; border: 1px solid #dde5ef;"
-                           " border-radius: 5px; padding: 3px 8px; min-width: 60px; }")
-        _edit_style     = ("QLineEdit { font-size: 12px; font-weight: bold; font-family: monospace;"
-                           " border: 1px solid #90caf9; border-radius: 5px; padding: 3px 6px; }"
-                           "QLineEdit:focus { border-color: #1565C0; }")
+        _section_lbl_style = "QLabel { font-size: 11px; font-weight: bold; color: #4a6078; border: none; text-transform: uppercase; letter-spacing: 1px; }"
+        _disp_style = ("QLabel { font-size: 13px; font-weight: bold; font-family: monospace;"
+                       " color: #1565C0; background: #f4f7fb; border: 1px solid #dde5ef;"
+                       " border-radius: 5px; padding: 3px 8px; min-width: 64px; }")
+        _edit_style = ("QLineEdit { font-size: 12px; font-weight: bold; font-family: monospace;"
+                       " border: 1px solid #90caf9; border-radius: 5px; padding: 3px 6px; min-width: 64px; }"
+                       "QLineEdit:focus { border-color: #1565C0; }")
+        _ph_action_style = """
+            QPushButton { font-size: 11px; font-weight: bold; border-radius: 5px;
+                padding: 4px 0px; color: #ffffff; border: none; background: #1565C0; }
+            QPushButton:hover { background: #1976D2; }
+            QPushButton:disabled { background: #bcc8d8; color: #8898a8; }
+        """
 
-        # display labels (real-time position, updated by set_ph_loc_full)
+        # display labels (realtime, updated by set_ph_loc_full)
         _disp_x = QLabel(self._window.orig_loc[0])
         _disp_y = QLabel(self._window.orig_loc[1])
         _disp_r = QLabel(self._window.orig_loc[2])
-        # proxy: make set_ph_loc_full also update these display labels
         self._ph_disp_labels = [_disp_x, _disp_y, _disp_r]
         for lbl in self._ph_disp_labels:
             lbl.setStyleSheet(_disp_style)
             lbl.setAlignment(Qt.AlignmentFlag.AlignCenter)
 
-        # edit controls (direct input)
         for e in [self._ph_x_edit_ctrl, self._ph_y_edit_ctrl, self._ph_r_edit_ctrl]:
-            e.setMinimumWidth(52)
-            e.setFixedHeight(26)
+            e.setFixedHeight(28)
+            e.setAlignment(Qt.AlignmentFlag.AlignCenter)
             e.setStyleSheet(_edit_style)
 
-        _ph_action_style = """
-            QPushButton { font-size: 11px; font-weight: bold; border-radius: 5px;
-                padding: 5px 0px; color: #ffffff; border: none; background: #1565C0; }
-            QPushButton:hover { background: #1976D2; }
-            QPushButton:disabled { background: #bcc8d8; color: #8898a8; }
-        """
+        # ── grid body: Current | Go to | Buttons ────────────────────────
+        from PyQt5.QtWidgets import QGridLayout
+        ph_grid = QGridLayout()
+        ph_grid.setSpacing(6)
+        ph_grid.setColumnStretch(2, 1)  # disp stretch
+        ph_grid.setColumnStretch(6, 1)  # edit stretch
 
-        # body = left (axes) | right (buttons)
-        ph_body = QHBoxLayout(); ph_body.setSpacing(10)
-        ph_left  = QVBoxLayout(); ph_left.setSpacing(5)
+        # headers row 0
+        cur_hdr = QLabel("Current"); cur_hdr.setStyleSheet(_section_lbl_style)
+        goto_hdr = QLabel("Go to");  goto_hdr.setStyleSheet(_section_lbl_style)
+        ph_grid.addWidget(cur_hdr,  0, 0, 1, 4)
+        ph_grid.addWidget(goto_hdr, 0, 5, 1, 3)
 
-        # 3 step rows: [←] axis [disp] unit [→]
-        step_rows_cfg = [
-            ("X", "triangle-left",  "triangle-right", _disp_x, "mm", 0),
-            ("Y", "triangle-down",  "triangle-up",    _disp_y, "mm", 1),
-            ("R", "triangle-left",  "triangle-right", _disp_r, "°",  2),
+        # vertical separator spanning all data rows
+        vsep = QFrame(); vsep.setFrameShape(QFrame.VLine)
+        vsep.setStyleSheet("QFrame { background: #dde5ef; border: none; }")
+        ph_grid.addWidget(vsep, 0, 4, 4, 1)
+
+        axes_cfg = [
+            ("X", _disp_x, self._ph_x_edit_ctrl, "mm"),
+            ("Y", _disp_y, self._ph_y_edit_ctrl, "mm"),
+            ("R", _disp_r, self._ph_r_edit_ctrl, "°"),
         ]
-        for axis, neg_icon, pos_icon, disp_lbl, unit, ax_idx in step_rows_cfg:
-            b_neg = _ph_btn(neg_icon)
-            b_pos = _ph_btn(pos_icon)
-            b_neg.clicked.connect(lambda _c, a=ax_idx: self._ph_step(a, -1))
-            b_pos.clicked.connect(lambda _c, a=ax_idx: self._ph_step(a,  1))
-            a_lbl = QLabel(axis); a_lbl.setStyleSheet(_axis_lbl_style); a_lbl.setFixedWidth(14)
-            u_lbl = QLabel(unit); u_lbl.setStyleSheet(_unit_lbl_style)
-            row = QHBoxLayout(); row.setSpacing(5)
-            row.addWidget(b_neg)
-            row.addWidget(a_lbl)
-            row.addWidget(disp_lbl, 1)
-            row.addWidget(u_lbl)
-            row.addWidget(b_pos)
-            ph_left.addLayout(row)
-
-        # separator
-        sep = QFrame(); sep.setFrameShape(QFrame.HLine)
-        sep.setStyleSheet("QFrame { background: #dde5ef; border: none; max-height: 1px; }")
-        ph_left.addWidget(sep)
-
-        # direct input row: X [__] mm  Y [__] mm  R [__] °
-        input_row = QHBoxLayout(); input_row.setSpacing(4)
-        for axis, edit, unit in [("X", self._ph_x_edit_ctrl, "mm"),
-                                  ("Y", self._ph_y_edit_ctrl, "mm"),
-                                  ("R", self._ph_r_edit_ctrl, "°")]:
-            a = QLabel(axis); a.setStyleSheet(_axis_lbl_style); a.setFixedWidth(14)
-            u = QLabel(unit); u.setStyleSheet(_unit_lbl_style)
-            input_row.addWidget(a)
-            input_row.addWidget(edit, 1)
-            input_row.addWidget(u)
-            if unit != "°":
-                input_row.addSpacing(4)
-        ph_left.addLayout(input_row)
-
-        ph_body.addLayout(ph_left, 1)
-
-        # action buttons column
-        btn_col = QVBoxLayout(); btn_col.setSpacing(4)
+        btn_slots = [
+            ("Home",   lambda: self._ph_locate("home")),
+            ("Center", lambda: self._ph_locate("center")),
+            ("Apply",  self._ph_apply),
+        ]
         self._ph_apply_btn = QPushButton("Apply")
-        for label, slot in [("Home",   lambda: self._ph_locate("home")),
-                             ("Center", lambda: self._ph_locate("center")),
-                             ("Clear",  self._ph_clear),
-                             ("Apply",  self._ph_apply)]:
+
+        for i, (axis, disp_lbl, edit, unit) in enumerate(axes_cfg):
+            row = i + 1
+            # Current side
+            a_cur = QLabel(axis); a_cur.setStyleSheet(_axis_lbl_style); a_cur.setFixedWidth(14)
+            u_cur = QLabel(unit); u_cur.setStyleSheet(_unit_lbl_style)
+            ph_grid.addWidget(a_cur,    row, 0)
+            ph_grid.addWidget(disp_lbl, row, 1)
+            ph_grid.addWidget(u_cur,    row, 2)
+            ph_grid.addWidget(QLabel(), row, 3)  # spacer
+
+            # Go to side
+            a_go = QLabel(axis); a_go.setStyleSheet(_axis_lbl_style); a_go.setFixedWidth(14)
+            u_go = QLabel(unit); u_go.setStyleSheet(_unit_lbl_style)
+            ph_grid.addWidget(a_go,  row, 5)
+            ph_grid.addWidget(edit,  row, 6)
+            ph_grid.addWidget(u_go,  row, 7)
+
+            # Action button column
+            label, slot = btn_slots[i]
             b = QPushButton(label)
             b.setStyleSheet(_ph_action_style)
-            b.setFixedWidth(70)
+            b.setFixedWidth(62)
             b.clicked.connect(slot)
-            btn_col.addWidget(b)
+            ph_grid.addWidget(b, row, 8)
             if label == "Apply":
                 self._ph_apply_btn = b
                 b.setEnabled(False)
-        ph_body.addLayout(btn_col)
+
+        ph_body = QHBoxLayout()
+        ph_body.addLayout(ph_grid)
 
         ph_inner_layout.addLayout(ph_body)
-
         ph_card_layout.addWidget(ph_inner)
         left_layout.addWidget(self._phantom_card)
 
@@ -741,15 +768,17 @@ class RunWidget(QWidget):
         outpath_row.addWidget(self._outpath_btn)
         outpath_card_layout.addLayout(outpath_row)
 
-        self._rsync_btn.setFixedWidth(120)
-        self._rsync_btn.setFixedHeight(26)
-        self._rsync_btn.setIcon(QIcon("./images/link-2.svg"))
-        rsync_row = QHBoxLayout()
-        rsync_row.setSpacing(8)
-        rsync_row.addWidget(self._rsync_label, 1)
-        rsync_row.addWidget(self._rsync_nopass_check)
-        rsync_row.addWidget(self._rsync_btn)
-        outpath_card_layout.addLayout(rsync_row)
+        self._rsync_connect_btn.setFixedWidth(120)
+        self._rsync_connect_btn.setFixedHeight(26)
+        self._rsync_connect_btn.setIcon(QIcon("./images/link-2.svg"))
+        rsync_addr_row = QHBoxLayout()
+        rsync_addr_row.setSpacing(8)
+        rsync_addr_row.addWidget(QLabel("SSH:"), 0)
+        rsync_addr_row.addWidget(self._rsync_addr_edit, 1)
+        rsync_addr_row.addWidget(QLabel("Path:"), 0)
+        rsync_addr_row.addWidget(self._rsync_path_edit, 1)
+        rsync_addr_row.addWidget(self._rsync_connect_btn)
+        outpath_card_layout.addLayout(rsync_addr_row)
 
 
         right_layout.addWidget(outpath_card)
@@ -1005,7 +1034,7 @@ class RunWidget(QWidget):
             self._ph_apply_btn.setEnabled(False)
 
     def set_ph_loc_full(self, loc):
-        """อัพเดต position labels + display labels + edit inputs"""
+        """อัพเดต Current position labels เท่านั้น — ไม่แตะ Go to inputs"""
         self._window.orig_loc = loc
         self._ph_x_label.setText(loc[0])
         self._ph_y_label.setText(loc[1])
@@ -1013,9 +1042,6 @@ class RunWidget(QWidget):
         if hasattr(self, '_ph_disp_labels'):
             for lbl, val in zip(self._ph_disp_labels, loc):
                 lbl.setText(val)
-        self._ph_x_edit_ctrl.setText(loc[0])
-        self._ph_y_edit_ctrl.setText(loc[1])
-        self._ph_r_edit_ctrl.setText(loc[2])
 
     def open_file(self):
         options = QFileDialog.Options()
@@ -1093,7 +1119,7 @@ class RunWidget(QWidget):
     def _set_rsync_status(self, text, color):
         self._rsync_status_label.setText(text)
         self._rsync_status_label.setStyleSheet(f"QLabel{{ font-size: 12px; color: {color}; font-family: monospace; }}")
-        _base = "QLabel { font-size: 12px; font-weight: bold; background: transparent; border: none; padding: 3px 10px; font-family: monospace; }"
+        _base = "QLabel { font-size: 11px; font-weight: bold; background: transparent; border: none; padding: 3px 10px; font-family: monospace; }"
         if not text:
             self._rsync_header_label.setText("rsync: —")
             self._rsync_header_label.setStyleSheet(_base + "QLabel { color: rgba(255,255,255,0.35); }")
@@ -1112,34 +1138,116 @@ class RunWidget(QWidget):
         else:
             self._show_toast("rsync failed ✗", detail, icon="✗", icon_color="#ef5350")
 
-    def _save_rsync_nopass(self):
-        try:
-            with open(self._config_path, 'r') as f:
-                _cfg = json.load(f)
-        except (FileNotFoundError, json.JSONDecodeError):
-            _cfg = {}
-        _cfg['rsync_no_password'] = self._rsync_nopass_check.isChecked()
-        with open(self._config_path, 'w') as f:
-            json.dump(_cfg, f)
+    @pyqtSlot(str, str)
+    def _monitor_done_slot(self, kind, detail):
+        if kind == "ok":
+            self._show_toast("monitor done ✓", detail)
+        else:
+            self._show_toast("monitor failed ✗", detail, icon="✗", icon_color="#ef5350")
 
-    def chooseRsyncDest(self):
-        text, ok = QInputDialog.getText(
-            self, "rsync destination",
-            "Enter rsync destination (e.g. user@host:/path/to/folder):",
-            QLineEdit.Normal,
-            self._rsync_label.text() if self._rsync_label.text() != "rsync destination not set" else ""
+    @pyqtSlot(str, str)
+    def _rsync_progress_slot(self, pct, speed):
+        if self._rsync_toast:
+            self._rsync_toast.update_progress(pct, speed)
+
+    @pyqtSlot(str, str)
+    def _rsync_toast_done_slot(self, kind, detail):
+        if self._rsync_toast:
+            self._rsync_toast.set_done(success=(kind == "ok"), detail=detail)
+            self._rsync_toast = None
+
+    def _rsync_connect(self):
+        addr = self._rsync_addr_edit.text().strip()
+        rpath = self._rsync_path_edit.text().strip()
+        if not addr or not rpath:
+            QMessageBox.warning(self, "rsync", "Please fill in SSH address and remote path.")
+            return
+        pwd, ok = QInputDialog.getText(
+            self, "SSH Password",
+            f"Password for {addr}:\n(leave blank to use SSH key)",
+            QLineEdit.Password
         )
-        if ok:
-            dest = text.strip()
-            self._rsync_label.setText(dest if dest else "rsync destination not set")
+        if not ok:
+            return
+        password = pwd if pwd.strip() else None
+        self._set_rsync_status("connecting...", "#ffd740")
+        _pwd_ssh_opts = [
+            '-o', 'StrictHostKeyChecking=no',
+            '-o', 'PreferredAuthentications=keyboard-interactive,password',
+            '-o', 'PubkeyAuthentication=no',
+        ]
+        _key_ssh_opts = ['-o', 'StrictHostKeyChecking=no']
+
+        def _do_test():
+            mkdir_cmd = f'mkdir -p "{rpath}/raw" "{rpath}/root" "{rpath}/scripts" "{rpath}/log"'
+            if password:
+                result = subprocess.run(
+                    ['sshpass', '-p', password, 'ssh'] + _pwd_ssh_opts + [addr, mkdir_cmd],
+                    stdout=subprocess.DEVNULL, stderr=subprocess.PIPE
+                )
+            else:
+                result = subprocess.run(
+                    ['ssh'] + _key_ssh_opts + [addr, mkdir_cmd],
+                    stdout=subprocess.DEVNULL, stderr=subprocess.PIPE
+                )
+            err = result.stderr.decode(errors='replace').strip()
+            if result.returncode != 0:
+                QMetaObject.invokeMethod(self, "_rsync_connect_failed_slot",
+                    Qt.ConnectionType.QueuedConnection,
+                    Q_ARG(str, err))
+                return
+            import os as _os
+            _proj_root = _os.path.normpath(
+                _os.path.join(_os.path.dirname(_os.path.abspath(__file__)), '..', '..')
+            )
+            _scripts_to_upload = [
+                _os.path.join(_proj_root, 'StdEventMonitor_fast.py'),
+                _os.path.join(_proj_root, 'run_with_stats.py'),
+            ]
+            _script_dest = f"{addr}:{rpath}/scripts/"
+            if password:
+                rsync_result = subprocess.run(
+                    ['sshpass', '-p', password, 'rsync', '-az',
+                     '-e', 'ssh ' + ' '.join(_pwd_ssh_opts)]
+                    + _scripts_to_upload + [_script_dest],
+                    stdout=subprocess.DEVNULL, stderr=subprocess.PIPE
+                )
+            else:
+                rsync_result = subprocess.run(
+                    ['rsync', '-az'] + _scripts_to_upload + [_script_dest],
+                    stdout=subprocess.DEVNULL, stderr=subprocess.PIPE
+                )
+            if rsync_result.returncode != 0:
+                err = rsync_result.stderr.decode(errors='replace').strip()
+                QMetaObject.invokeMethod(self, "_rsync_connect_failed_slot",
+                    Qt.ConnectionType.QueuedConnection,
+                    Q_ARG(str, f"Script upload failed: {err}"))
+                return
+            global _ssh_password
+            _ssh_password = password
             try:
                 with open(self._config_path, 'r') as f:
                     _cfg = json.load(f)
             except (FileNotFoundError, json.JSONDecodeError):
                 _cfg = {}
-            _cfg['rsync_dest'] = dest
+            _cfg['rsync_address'] = addr
+            _cfg['rsync_path'] = rpath
             with open(self._config_path, 'w') as f:
                 json.dump(_cfg, f)
+            QMetaObject.invokeMethod(self, "_rsync_connected_slot", Qt.ConnectionType.QueuedConnection)
+
+        threading.Thread(target=_do_test, daemon=True).start()
+
+    @pyqtSlot()
+    def _rsync_connected_slot(self):
+        self._set_rsync_status("rsync connected", "#69f0ae")
+
+    @pyqtSlot(str)
+    def _rsync_connect_failed_slot(self, err):
+        global _ssh_password
+        _ssh_password = None
+        self._set_rsync_status("", "")
+        self._show_toast("rsync connection failed", err[:200], icon="✗", icon_color="#ef5350")
 
     def chooseOutpath(self):
         options = QFileDialog.Options()
@@ -1189,15 +1297,17 @@ class RunWidget(QWidget):
         outpath_layout.addWidget(self._outpath_label)
         outpath_layout.addWidget(self._outpath_btn)
         outpath_layout.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        rsync_layout2 = QHBoxLayout()
-        self._rsync_btn.setFixedWidth(150)
-        rsync_btn_icon2 = QIcon("./images/link-2.svg")
-        self._rsync_btn.setIcon(rsync_btn_icon2)
-        rsync_layout2.addWidget(self._rsync_label)
-        rsync_layout2.addWidget(self._rsync_btn)
-        rsync_layout2.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        rsync_addr_layout2 = QHBoxLayout()
+        self._rsync_connect_btn.setFixedWidth(150)
+        self._rsync_connect_btn.setIcon(QIcon("./images/link-2.svg"))
+        rsync_addr_layout2.addWidget(QLabel("SSH:"))
+        rsync_addr_layout2.addWidget(self._rsync_addr_edit, 1)
+        rsync_addr_layout2.addWidget(QLabel("Path:"))
+        rsync_addr_layout2.addWidget(self._rsync_path_edit, 1)
+        rsync_addr_layout2.addWidget(self._rsync_connect_btn)
+        rsync_addr_layout2.setAlignment(Qt.AlignmentFlag.AlignCenter)
         outpath_outer_layout2.addLayout(outpath_layout)
-        outpath_outer_layout2.addLayout(rsync_layout2)
+        outpath_outer_layout2.addLayout(rsync_addr_layout2)
         self._rsync_status_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
         outpath_outer_layout2.addWidget(self._rsync_status_label)
         outpath_widget.setLayout(outpath_outer_layout2)
@@ -1375,6 +1485,19 @@ class RunWidget(QWidget):
         self._launch_eudaq_default.setEnabled(False)
         self._first_file = self.get_new_outfile()
         self._pid = eudaq.default_run(self._line_edits, self._outpath_label.text())
+        psutil.cpu_percent(interval=None)  # warm-up
+        self._run_stats_start = {
+            'time':  time.monotonic(),
+            'disk':  psutil.disk_io_counters(),
+            'net':   psutil.net_io_counters(),
+        }
+        try:
+            import modules.sim as _sim
+            _sim_log_path = _sim.sim_log_path
+            self._program_log_buffer = ("sim", _sim_log_path, os.path.getsize(_sim_log_path))
+        except (ImportError, AttributeError, OSError):
+            self._program_log_buffer = io.StringIO()
+            sys.stdout = _TeeWriter(sys.stdout, self._program_log_buffer)
         # reset Control Room กลับ Standby เมื่อเริ่ม EUDAQ session ใหม่
         try:
             import modules.sim as _sim
@@ -1410,75 +1533,161 @@ class RunWidget(QWidget):
             self._current_file = self._first_file
             with open("./logs.txt", "a") as f:
                 f.write(f"{self._current_file},{','.join([v.text() for v in self._line_edits.values()])}\n")
-            rsync_dest = self._rsync_label.text() if self._rsync_label.text() != "rsync destination not set" else ""
+            # stop stdout capture and collect program log content
+            _program_log_content = ""
+            if isinstance(self._program_log_buffer, tuple) and self._program_log_buffer[0] == "sim":
+                _, _sim_log_path, _sim_log_offset = self._program_log_buffer
+                try:
+                    with open(_sim_log_path, 'r', encoding='utf-8', errors='replace') as _f:
+                        _f.seek(_sim_log_offset)
+                        _program_log_content = _f.read()
+                except OSError:
+                    pass
+            elif isinstance(self._program_log_buffer, io.StringIO):
+                if isinstance(sys.stdout, _TeeWriter):
+                    sys.stdout = sys.stdout._original
+                _program_log_content = self._program_log_buffer.getvalue()
+            self._program_log_buffer = None
+            # append run stats block
+            if self._run_stats_start is not None:
+                _elapsed = time.monotonic() - self._run_stats_start['time']
+                _disk_end = psutil.disk_io_counters()
+                _net_end  = psutil.net_io_counters()
+                _cpu      = psutil.cpu_percent(interval=None)
+                _mem      = psutil.virtual_memory()
+                _disk_w   = (_disk_end.write_bytes - self._run_stats_start['disk'].write_bytes) / 1024 / 1024
+                _net_s    = (_net_end.bytes_sent   - self._run_stats_start['net'].bytes_sent)   / 1024 / 1024
+                _net_r    = (_net_end.bytes_recv   - self._run_stats_start['net'].bytes_recv)   / 1024 / 1024
+                _m, _s    = divmod(_elapsed, 60)
+                try:
+                    import subprocess as _sp
+                    _gpu_r = _sp.run(
+                        ['nvidia-smi', '--query-gpu=utilization.gpu,memory.used,memory.total,temperature.gpu',
+                         '--format=csv,noheader,nounits'],
+                        capture_output=True, text=True, timeout=3
+                    )
+                    if _gpu_r.returncode == 0:
+                        _gu, _gmu, _gmt, _gt = [x.strip() for x in _gpu_r.stdout.strip().split(',')]
+                        _gpu_line = f"  GPU       : util={_gu}%  mem={_gmu}/{_gmt} MiB  temp={_gt}°C\n"
+                    else:
+                        _gpu_line = ""
+                except Exception:
+                    _gpu_line = ""
+                _program_log_content += (
+                    "\n--- Run Stats ---\n"
+                    f"  Elapsed   : {int(_m):02d}:{_s:05.2f}\n"
+                    f"  CPU       : {_cpu:.1f}%\n"
+                    f"  RAM       : {_mem.used//1024//1024}/{_mem.total//1024//1024} MiB ({_mem.percent:.1f}%)\n"
+                    + _gpu_line +
+                    f"  Disk write: {_disk_w:.1f} MiB\n"
+                    f"  Net sent  : {_net_s:.1f} MiB\n"
+                    f"  Net recv  : {_net_r:.1f} MiB\n"
+                    "-----------------\n"
+                )
+                self._run_stats_start = None
+            rsync_addr = self._rsync_addr_edit.text().strip()
+            rsync_rpath = self._rsync_path_edit.text().strip()
+            rsync_dest = f"{rsync_addr}:{rsync_rpath}/raw" if rsync_addr and rsync_rpath else ""
             if rsync_dest and self._current_file:
-                global _ssh_password, _ssh_password_time
-                if self._rsync_nopass_check.isChecked():
-                    # SSH key auth — ไม่ถามรหัสผ่าน
-                    _ssh_password = None
-                    _ssh_password_time = time.time()
-                else:
-                    now = time.time()
-                    if _ssh_password_time is None or (now - _ssh_password_time) >= _SSH_PASSWORD_TTL:
-                        pwd, ok = QInputDialog.getText(
-                            self, "SSH Password",
-                            f"Password for {rsync_dest.split(':')[0]}\n(leave blank to use SSH key):",
-                            QLineEdit.Password
-                        )
-                        if ok:
-                            _ssh_password = pwd if pwd else None
-                            _ssh_password_time = now
-                        else:
-                            _ssh_password = None
-                            _ssh_password_time = now
-                print(f"[rsync] {self._current_file} → {rsync_dest}")
-                self._set_rsync_status("sending...", "#ffd740")
-                # force password-only auth เมื่อมี password (ป้องกัน key override)
+                import re as _re
+                from modules.ui.rsync_toast import RsyncToast
+                _rsync_pct_re = _re.compile(r'(\d+)%\s+([\d.]+\S+/s)')
                 _pwd_ssh_opts = [
                     '-o', 'StrictHostKeyChecking=no',
                     '-o', 'PreferredAuthentications=keyboard-interactive,password',
                     '-o', 'PubkeyAuthentication=no',
                 ]
                 _key_ssh_opts = ['-o', 'StrictHostKeyChecking=no']
-                import re as _re
-                _rsync_pct_re = _re.compile(r'(\d+)%\s+([\d.]+\S+/s)')
+                print(f"[rsync] {self._current_file} → {rsync_dest}")
+                fname_short = self._current_file.split('/')[-1]
+                self._rsync_toast = RsyncToast(fname_short, rsync_addr, parent=self._window)
+                self._rsync_toast.show_centered(self._window)
 
                 def _stream_rsync(proc):
-                    """อ่าน stdout ทีละบรรทัด แล้วอัพเดต header label แบบ realtime"""
                     for raw in proc.stdout:
                         line = raw.decode('utf-8', errors='replace').rstrip()
                         m = _rsync_pct_re.search(line)
                         if m:
                             pct, speed = m.group(1), m.group(2)
-                            QMetaObject.invokeMethod(self, "_set_rsync_status_slot",
+                            QMetaObject.invokeMethod(self, "_rsync_progress_slot",
                                 Qt.ConnectionType.QueuedConnection,
-                                Q_ARG(str, f"Sending {pct}%  {speed}"), Q_ARG(str, "#ffd740"))
+                                Q_ARG(str, pct), Q_ARG(str, speed))
                     proc.wait()
                     return proc.returncode, proc.stderr.read()
 
+                def _rsync_program_log(fname, log_content, password):
+                    import os as _os, tempfile as _tempfile
+                    fname_base = _os.path.splitext(fname)[0]
+                    with _tempfile.NamedTemporaryFile(
+                        mode='w', suffix='.log', prefix=f"{fname_base}_program_",
+                        delete=False, encoding='utf-8'
+                    ) as tf:
+                        tf.write(log_content)
+                        tmp_path = tf.name
+                    remote_log = f"{rsync_rpath}/log/{fname_base}_program.log"
+                    log_dest = f"{rsync_addr}:{remote_log}"
+                    print(f"[program log] rsync → {log_dest}")
+                    if password:
+                        result = subprocess.run(
+                            ['sshpass', '-p', password, 'rsync', '-az',
+                             '-e', 'ssh ' + ' '.join(_pwd_ssh_opts),
+                             tmp_path, log_dest],
+                            stdout=subprocess.DEVNULL, stderr=subprocess.PIPE
+                        )
+                    else:
+                        result = subprocess.run(
+                            ['rsync', '-az', tmp_path, log_dest],
+                            stdout=subprocess.DEVNULL, stderr=subprocess.PIPE
+                        )
+                    _os.unlink(tmp_path)
+                    if result.returncode == 0:
+                        print(f"[program log] done → {remote_log}")
+                    else:
+                        print(f"[program log] ERROR: {result.stderr.decode(errors='replace').strip()}")
+
+                def _run_monitor(fname, password):
+                    import os as _os
+                    fname_base = _os.path.splitext(fname)[0]
+                    remote_raw     = f"{rsync_rpath}/raw/{fname}"
+                    remote_root    = f"{rsync_rpath}/root/{fname_base}.root"
+                    remote_wrapper = f"{rsync_rpath}/scripts/run_with_stats.py"
+                    remote_log     = f"{rsync_rpath}/log/{fname_base}_std.log"
+                    cmd = (
+                        f'~/sutpct-env/bin/python3 "{remote_wrapper}"'
+                        f' "{remote_raw}" -o "{remote_root}"'
+                        f' > "{remote_log}" 2>&1'
+                    )
+                    print(f"[monitor] SSH → {rsync_addr}: {cmd}")
+                    if password:
+                        result = subprocess.run(
+                            ['sshpass', '-p', password, 'ssh'] + _pwd_ssh_opts + [rsync_addr, cmd],
+                            stdout=subprocess.DEVNULL, stderr=subprocess.PIPE
+                        )
+                    else:
+                        result = subprocess.run(
+                            ['ssh'] + _key_ssh_opts + [rsync_addr, cmd],
+                            stdout=subprocess.DEVNULL, stderr=subprocess.PIPE
+                        )
+                    if result.returncode == 0:
+                        print(f"[monitor] done → {remote_root}")
+                        QMetaObject.invokeMethod(self, "_monitor_done_slot",
+                            Qt.ConnectionType.QueuedConnection,
+                            Q_ARG(str, "ok"), Q_ARG(str, f"{fname_base}.root"))
+                    else:
+                        err_msg = result.stderr.decode(errors='replace').strip()
+                        print(f"[monitor] ERROR: {err_msg}")
+                        QMetaObject.invokeMethod(self, "_monitor_done_slot",
+                            Qt.ConnectionType.QueuedConnection,
+                            Q_ARG(str, "error"), Q_ARG(str, err_msg[:200]))
+
                 def _do_rsync(filepath, dest, password):
-                    if ':' in dest:
-                        host_part, path_part = dest.split(':', 1)
-                        if password:
-                            subprocess.run(
-                                ['sshpass', '-p', password, 'ssh'] + _pwd_ssh_opts + [host_part, f'mkdir -p "{path_part}"'],
-                                stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL
-                            )
-                            proc = subprocess.Popen(
-                                ['sshpass', '-p', password, 'rsync', '-az', '--progress',
-                                 '-e', 'ssh ' + ' '.join(_pwd_ssh_opts),
-                                 filepath, dest],
-                                stdout=subprocess.PIPE, stderr=subprocess.PIPE
-                            )
-                        else:
-                            subprocess.run(
-                                ['ssh'] + _key_ssh_opts + [host_part, f'mkdir -p "{path_part}"'],
-                                stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL
-                            )
-                            proc = subprocess.Popen(
-                                ['rsync', '-az', '--progress', filepath, dest],
-                                stdout=subprocess.PIPE, stderr=subprocess.PIPE
-                            )
+                    if password:
+                        proc = subprocess.Popen(
+                            ['sshpass', '-p', password, 'rsync', '-az', '--progress',
+                             '-e', 'ssh ' + ' '.join(_pwd_ssh_opts),
+                             filepath, dest],
+                            stdout=subprocess.PIPE, stderr=subprocess.PIPE
+                        )
                     else:
                         proc = subprocess.Popen(
                             ['rsync', '-az', '--progress', filepath, dest],
@@ -1487,31 +1696,37 @@ class RunWidget(QWidget):
                     returncode, err = _stream_rsync(proc)
                     if returncode == 0:
                         print(f"[rsync] OK → {dest}")
-                        QMetaObject.invokeMethod(self, "_set_rsync_status_slot",
+                        QMetaObject.invokeMethod(self, "_rsync_toast_done_slot",
                             Qt.ConnectionType.QueuedConnection,
-                            Q_ARG(str, "rsync done"), Q_ARG(str, "#69f0ae"))
+                            Q_ARG(str, "ok"), Q_ARG(str, f"Sent to {dest.split(':')[0]}"))
                         QMetaObject.invokeMethod(self, "_notify_rsync_slot",
                             Qt.ConnectionType.QueuedConnection,
                             Q_ARG(str, "ok"), Q_ARG(str, f"Sent to {dest.split(':')[0]}"))
+                        threading.Thread(target=_run_monitor, args=(fname_short, password), daemon=True).start()
+                        threading.Thread(target=_rsync_program_log, args=(fname_short, _program_log_content, password), daemon=True).start()
                     else:
                         err_msg = err.decode(errors='replace').strip()
                         print(f"[rsync] ERROR (code {returncode}): {err_msg}")
-                        global _ssh_password, _ssh_password_time
+                        global _ssh_password
                         _ssh_password = None
-                        _ssh_password_time = None
-                        # ตรวจ auth failure
                         if returncode == 23 or 'auth' in err_msg.lower() or 'permission denied' in err_msg.lower() or 'password' in err_msg.lower():
-                            detail = f"Authentication failed — wrong password?\n{err_msg[:120]}"
+                            detail = f"Authentication failed — reconnect required\n{err_msg[:120]}"
                         else:
                             detail = f"Exit code {returncode}\n{err_msg[:120]}"
                         QMetaObject.invokeMethod(self, "_set_rsync_status_slot",
                             Qt.ConnectionType.QueuedConnection,
-                            Q_ARG(str, f"rsync failed ({returncode})"), Q_ARG(str, "#ef5350"))
+                            Q_ARG(str, "rsync fail"), Q_ARG(str, "#ef5350"))
+                        QMetaObject.invokeMethod(self, "_rsync_toast_done_slot",
+                            Qt.ConnectionType.QueuedConnection,
+                            Q_ARG(str, "error"), Q_ARG(str, detail))
                         QMetaObject.invokeMethod(self, "_notify_rsync_slot",
                             Qt.ConnectionType.QueuedConnection,
                             Q_ARG(str, "error"), Q_ARG(str, detail))
+                        QMetaObject.invokeMethod(self, "_rsync_connect_failed_slot",
+                            Qt.ConnectionType.QueuedConnection,
+                            Q_ARG(str, detail))
                 threading.Thread(target=_do_rsync, args=(self._current_file, rsync_dest, _ssh_password), daemon=True).start()
-                rsync_note = f"rsync → {rsync_dest.split(':')[0]} (sending...)"
+                rsync_note = f"rsync → {rsync_addr} (sending...)"
             else:
                 print(f"[rsync] skipped — dest='{rsync_dest}' file='{self._current_file}'")
                 rsync_note = "rsync: skipped"
@@ -1553,6 +1768,16 @@ class RunWidget(QWidget):
         }
 
     def enable_beam(self):
+        if self._enable_checkbox.isChecked():
+            if not (self._window._alpide_connect and self._window._zaber_connect and self._window._fpga_connect):
+                msg = QMessageBox()
+                msg.setIcon(QMessageBox.Warning)
+                msg.setText("Not all devices connected")
+                msg.setInformativeText("Please connect ALPIDE, Zaber, and FPGA before enabling.")
+                msg.setWindowTitle("Warning")
+                msg.exec_()
+                self._enable_checkbox.setChecked(False)
+                return
         try:
             if self._ser:
                 try:
@@ -1572,14 +1797,14 @@ class RunWidget(QWidget):
                 self._ser.write(b'\x02')
                 for b in fpga_data["byte_start_list"][1:]:
                     self._ser.write(b)
-                has_rsync = bool(self._rsync_label.text() if self._rsync_label.text() != "rsync destination not set" else "")
+                has_rsync = bool(self._rsync_addr_edit.text().strip() and self._rsync_path_edit.text().strip())
                 self._kill_beam_btn.setEnabled(has_rsync)
                 self._launch_eudaq_default.setEnabled(has_rsync)
                 if not has_rsync:
                     msg = QMessageBox()
                     msg.setIcon(QMessageBox.Warning)
                     msg.setText("rsync destination is empty")
-                    msg.setInformativeText("Please fill in the rsync destination before running.")
+                    msg.setInformativeText("Please fill in SSH address and remote path, then click Connect.")
                     msg.setWindowTitle("Warning")
                     msg.exec_()
                 self._window.running(True)
@@ -1629,7 +1854,7 @@ class RunWidget(QWidget):
             self._connection["fpga"].setStyleSheet(self._connect_styles[0])
             
         self._update_firmware_label()
-    
+
     def check_connection(self, device):
         if device == "alpide":
             if alpide.found_daqs():
@@ -1670,7 +1895,7 @@ class RunWidget(QWidget):
                 self._connection["fpga"].setStyleSheet(self._connect_styles[0])
         
         self._update_firmware_label()
-        
+
     def check_zaber_nohome(self):
         try:
             conn = zaber_connect.connect(get_port("zaber"))
@@ -1772,8 +1997,228 @@ class RunWidget(QWidget):
         self._window.running(False)
         self._show_toast("Beam cleared ✓", "Ready for next run")
 
-    def _show_toast(self, title, message, duration_ms=30000, icon="✓", icon_color="#00e676"):
+    # ── Notification bell ────────────────────────────────────────────────
+
+    def _update_bell_badge(self):
+        if self._unread_count > 0:
+            self._bell_badge.setText(str(min(self._unread_count, 99)))
+            self._bell_badge.setVisible(True)
+            self._bell_btn.setStyleSheet("""
+                QPushButton {
+                    font-size: 17px;
+                    background-color: rgba(255,71,87,0.25);
+                    border: 1px solid #ff4757;
+                    border-radius: 7px;
+                    color: #ffffff;
+                }
+                QPushButton:hover { background-color: rgba(255,71,87,0.38); }
+            """)
+        else:
+            self._bell_badge.setVisible(False)
+            self._bell_btn.setStyleSheet("""
+                QPushButton {
+                    font-size: 17px;
+                    background-color: rgba(255,255,255,0.08);
+                    border: 1px solid rgba(255,255,255,0.18);
+                    border-radius: 7px;
+                    color: #ffffff;
+                }
+                QPushButton:hover { background-color: rgba(255,255,255,0.18); }
+                QPushButton:pressed { background-color: rgba(255,255,255,0.06); }
+            """)
+
+    def _toggle_notification_panel(self):
+        if self._notif_panel is None:
+            self._build_notification_panel()
+
+        if self._notif_panel.isVisible():
+            self._notif_panel.hide()
+        else:
+            # reset unread on open
+            self._unread_count = 0
+            self._update_bell_badge()
+            self._rebuild_notif_list()
+            self._reposition_notif_panel()
+            self._notif_panel.show()
+            self._notif_panel.raise_()
+
+    def _reposition_notif_panel(self):
+        if self._notif_panel is None:
+            return
+        panel_w = self._notif_panel.width()
+        x = self.width() - panel_w - 12
+        y = 60  # just below header
+        self._notif_panel.move(x, y)
+
+    def _build_notification_panel(self):
+        """Create the floating notification panel (lazy)."""
+        panel = QFrame(self)
+        panel.setObjectName("notifPanel")
+        panel.setFixedWidth(360)
+        panel.setStyleSheet("""
+            QFrame#notifPanel {
+                background-color: #0d1a2e;
+                border: 1px solid rgba(255,255,255,0.15);
+                border-radius: 10px;
+            }
+        """)
+
+        outer_layout = QVBoxLayout(panel)
+        outer_layout.setContentsMargins(0, 0, 0, 0)
+        outer_layout.setSpacing(0)
+
+        # ── panel header bar ─────────────────────────────────────────────
+        header_bar = QFrame()
+        header_bar.setFixedHeight(42)
+        header_bar.setStyleSheet("""
+            QFrame {
+                background-color: #1e3a5f;
+                border-radius: 10px 10px 0px 0px;
+                border: none;
+            }
+            QLabel { border: none; color: #e0e8f8; font-size: 13px; font-weight: bold; }
+        """)
+        hb_layout = QHBoxLayout(header_bar)
+        hb_layout.setContentsMargins(14, 0, 10, 0)
+        hb_layout.addWidget(QLabel("🔔  Notifications"))
+        hb_layout.addStretch()
+        clear_btn = QPushButton("Clear all")
+        clear_btn.setFixedHeight(26)
+        clear_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        clear_btn.setStyleSheet("""
+            QPushButton {
+                background-color: rgba(255,255,255,0.1);
+                color: #b0c8e8;
+                border: 1px solid rgba(255,255,255,0.2);
+                border-radius: 5px;
+                font-size: 11px;
+                padding: 0px 10px;
+            }
+            QPushButton:hover { background-color: rgba(255,255,255,0.2); color: #ffffff; }
+        """)
+        clear_btn.clicked.connect(self._clear_notifications)
+        hb_layout.addWidget(clear_btn)
+        outer_layout.addWidget(header_bar)
+
+        # ── scrollable list area ─────────────────────────────────────────
+        self._notif_scroll = QScrollArea()
+        self._notif_scroll.setWidgetResizable(True)
+        self._notif_scroll.setFrameShape(QFrame.NoFrame)
+        self._notif_scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
+        self._notif_scroll.setStyleSheet("""
+            QScrollArea { background: transparent; border: none; }
+            QScrollBar:vertical {
+                background: #0d1a2e; width: 6px; margin: 0;
+            }
+            QScrollBar::handle:vertical {
+                background: rgba(255,255,255,0.2); border-radius: 3px; min-height: 20px;
+            }
+            QScrollBar::add-line:vertical, QScrollBar::sub-line:vertical { height: 0; }
+        """)
+        self._notif_list_widget = QWidget()
+        self._notif_list_widget.setStyleSheet("QWidget { background: transparent; }")
+        self._notif_list_layout = QVBoxLayout(self._notif_list_widget)
+        self._notif_list_layout.setContentsMargins(8, 8, 8, 8)
+        self._notif_list_layout.setSpacing(6)
+        self._notif_list_layout.addStretch()
+        self._notif_scroll.setWidget(self._notif_list_widget)
+        outer_layout.addWidget(self._notif_scroll)
+
+        panel.hide()
+        self._notif_panel = panel
+
+    def _rebuild_notif_list(self):
+        """Repopulate notification list items."""
+        layout = self._notif_list_layout
+        # remove all except the trailing stretch
+        while layout.count() > 1:
+            item = layout.takeAt(0)
+            if item.widget():
+                item.widget().deleteLater()
+
+        if not self._notifications:
+            empty_lbl = QLabel("No notifications yet")
+            empty_lbl.setAlignment(Qt.AlignCenter)
+            empty_lbl.setStyleSheet("QLabel { color: rgba(255,255,255,0.3); font-size: 12px; padding: 24px; border: none; }")
+            layout.insertWidget(0, empty_lbl)
+        else:
+            for i, n in enumerate(self._notifications):
+                row = self._make_notif_row(n)
+                layout.insertWidget(i, row)
+
+        # resize panel height to fit (max 420)
+        self._notif_list_widget.adjustSize()
+        desired = min(max(self._notif_list_widget.sizeHint().height() + 52, 90), 420)
+        self._notif_panel.setFixedHeight(desired)
+
+    def _make_notif_row(self, n):
+        row = QFrame()
+        row.setStyleSheet(f"""
+            QFrame {{
+                background-color: rgba(255,255,255,0.04);
+                border: 1px solid rgba(255,255,255,0.08);
+                border-left: 3px solid {n['icon_color']};
+                border-radius: 6px;
+            }}
+            QLabel {{ border: none; }}
+        """)
+        rl = QVBoxLayout(row)
+        rl.setContentsMargins(10, 7, 10, 7)
+        rl.setSpacing(3)
+
+        top_row = QHBoxLayout()
+        top_row.setSpacing(6)
+        icon_lbl = QLabel(n["icon"])
+        icon_lbl.setStyleSheet(f"QLabel {{ color: {n['icon_color']}; font-size: 13px; }}")
+        title_lbl = QLabel(n["title"])
+        title_lbl.setStyleSheet(f"QLabel {{ color: {n['icon_color']}; font-size: 12px; font-weight: bold; }}")
+        time_lbl = QLabel(n["time"])
+        time_lbl.setStyleSheet("QLabel { color: rgba(255,255,255,0.3); font-size: 10px; }")
+        top_row.addWidget(icon_lbl)
+        top_row.addWidget(title_lbl)
+        top_row.addStretch()
+        top_row.addWidget(time_lbl)
+        rl.addLayout(top_row)
+
+        if n["message"]:
+            msg_lbl = QLabel(n["message"])
+            msg_lbl.setStyleSheet("QLabel { color: #8898a8; font-size: 11px; }")
+            msg_lbl.setWordWrap(True)
+            rl.addWidget(msg_lbl)
+
+        return row
+
+    def _clear_notifications(self):
+        self._notifications.clear()
+        self._unread_count = 0
+        self._update_bell_badge()
+        self._rebuild_notif_list()
+
+    def resizeEvent(self, event):
+        super().resizeEvent(event)
+        # reposition toasts
+        existing = [c for c in self.children() if isinstance(c, QFrame) and c.objectName() == "toast"]
+        for i, t in enumerate(existing):
+            t.move(self.width() - t.width() - 20, 56 + i * (t.height() + 10))
+        # reposition notification panel
+        if self._notif_panel and self._notif_panel.isVisible():
+            self._reposition_notif_panel()
+
+    def _show_toast(self, title, message, duration_ms=3000, icon="✓", icon_color="#00e676"):
         """แสดง toast notification มุมขวาบน auto-dismiss"""
+        # ── record in history ────────────────────────────────────────────
+        self._notifications.insert(0, {
+            "time": datetime.now().strftime("%H:%M:%S"),
+            "title": title,
+            "message": message,
+            "icon_color": icon_color,
+            "icon": icon,
+        })
+        self._unread_count += 1
+        self._update_bell_badge()
+        if self._notif_panel and self._notif_panel.isVisible():
+            self._rebuild_notif_list()
+
         existing = [c for c in self.children() if isinstance(c, QFrame) and c.objectName() == "toast"]
         offset_y = 56 + sum(c.height() + 10 for c in existing)
 

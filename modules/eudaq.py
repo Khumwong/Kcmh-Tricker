@@ -149,14 +149,20 @@ def install_firware():
     command = f'gnome-terminal -- bash -c "cd {alpide_dir} && {command_alpide}; exec bash"'
     process = subprocess.Popen(command, shell=True)
 
-def install_firmware_auto():
-    """รัน firmware installer แบบ synchronous (ไม่เปิด terminal) และรอจนเสร็จ"""
+def install_firmware_auto(parent_widget=None):
+    """รัน firmware installer พร้อม progress popup — block UI จนเสร็จ"""
+    from modules.ui.firmware_toast import FirmwareToast
+    toast = FirmwareToast(parent=parent_widget)
+    toast.show_centered(parent_widget)
+
     alpide_dir = "/home/santa/alpide-daq-software"
     result = subprocess.run(
         ["alpide-daq-program", "--fx3=./tmp/fx3.img", "--fpga=./tmp/fpga-v1.0.0.bit", "--all"],
         cwd=alpide_dir
     )
-    return result.returncode == 0
+    success = result.returncode == 0
+    toast.set_done(success)
+    return success
 
 def monitor(filepath):
     std_exc = "/home/santa/eudaq2/bin/StdEventMonitor"

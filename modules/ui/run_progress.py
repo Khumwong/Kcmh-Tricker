@@ -65,14 +65,16 @@ class ProgressWorker(QRunnable):
             locs = self.kwargs['locs']
             while True:
                 if force_stop:
-                    self.signals.progress.emit({"type": "progress", "value": 1000})
+                    # apply final step and emit before stopping
+                    locs = apply_steps_loop(self.kwargs['conn'], self.kwargs['steps'], self.kwargs['event_loop'])
+                    self.signals.progress.emit({"type": "progress", "value": 1000, "locs": locs})
                     self.kwargs['ser'].write(b'\xEF')
-                    # ser.write(b'\x00')
-                    # ser.close()
                     break
-                
+
                 if (datetime.datetime.now() - step_current_datetime).total_seconds() > self.args[1]:
                     self.kwargs['ser'].write(b'\xEF')
+                    # apply step first, then emit updated position
+                    locs = apply_steps_loop(self.kwargs['conn'], self.kwargs['steps'], self.kwargs['event_loop'])
                     self.signals.progress.emit({"type": "step", "value": step, "locs": locs})
                     value = int(step*1000/self.args[2])
                     step += 1
@@ -80,7 +82,6 @@ class ProgressWorker(QRunnable):
                     current_time = datetime.datetime.now()
                     if step > self.args[2]:
                         break
-                    locs = apply_steps_loop(self.kwargs['conn'], self.kwargs['steps'], self.kwargs['event_loop'])
                     self.kwargs['ser'].write(b'\xFE')
                 elif (datetime.datetime.now() - current_time).total_seconds() > self.args[0]:
                     value += 1
@@ -191,6 +192,16 @@ class RunProgress(QObject):
         force_stop = False
         self._is_running = False
         self._conn.close()
+        # disconnect beam signals ก่อน stop_run เพื่อป้องกัน force_stop leak
+        try:
+            import modules.sim as _sim
+            if _sim.control_room is not None:
+                try:
+                    _sim.control_room.beam_off_signal.disconnect(self._on_ctrl_beam_off)
+                except TypeError:
+                    pass
+        except (ImportError, AttributeError):
+            pass
         self._window.stop_run()
     
         
@@ -252,6 +263,8 @@ class RunProgress(QObject):
         force_stop = True
 
     def _start_worker(self):
+        global force_stop
+        force_stop = False
         _rp_log("_start_worker called — starting ProgressWorker thread")
         expose_time = (float(self._window._line_edits["Exposure time (ms)"].text()) +
                        float(self._window._line_edits["Beam delay (ms)"].text())

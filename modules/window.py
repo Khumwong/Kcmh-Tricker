@@ -122,7 +122,7 @@ class MyWindow(QMainWindow):
                 if "_run_widget" in self.__dict__:
                     self._run_widget._update_firmware_label()
                 import modules.eudaq as eudaq
-                eudaq.install_firmware_auto()
+                eudaq.install_firmware_auto(parent_widget=self)
             self._alpide_connect = True
         else:
             self._alpide_connect = False
@@ -196,17 +196,24 @@ class MyWindow(QMainWindow):
         self._run_widget.set_ph_loc(loc)
     
     def running(self, is_running):
+        rw = self._run_widget
         if is_running:
-            self._run_widget._phantom_card.setDisabled(True)
-            self._run_widget._outpath_btn.setDisabled(True)
-            for v in self._run_widget._connection.values():
+            rw._phantom_card.setDisabled(True)
+            rw._outpath_btn.setDisabled(True)
+            rw._rsync_addr_edit.setDisabled(True)
+            rw._rsync_path_edit.setDisabled(True)
+            rw._rsync_connect_btn.setDisabled(True)
+            for v in rw._connection.values():
                 v.setDisabled(True)
-            for ledit in self._run_widget._line_edits.values():
+            for ledit in rw._line_edits.values():
                 ledit.setDisabled(True)
         else:
-            self._run_widget._phantom_card.setDisabled(False)
-            self._run_widget._outpath_btn.setDisabled(False)
-            for v in self._run_widget._connection.values():
+            rw._phantom_card.setDisabled(False)
+            rw._outpath_btn.setDisabled(False)
+            rw._rsync_addr_edit.setDisabled(False)
+            rw._rsync_path_edit.setDisabled(False)
+            rw._rsync_connect_btn.setDisabled(False)
+            for v in rw._connection.values():
                 v.setDisabled(False)
-            for ledit in self._run_widget._line_edits.values():
+            for ledit in rw._line_edits.values():
                 ledit.setDisabled(False)

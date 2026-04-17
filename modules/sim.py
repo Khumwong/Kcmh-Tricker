@@ -31,9 +31,16 @@ def _make_sim_logger():
     logger.addHandler(ch)
 
     logger.info(f"Sim log started → {log_path}")
-    return logger
+    return logger, log_path
 
-_log = _make_sim_logger()
+_log, sim_log_path = _make_sim_logger()
+
+# ---------------------------------------------------------------------------
+# Module-level state
+# ---------------------------------------------------------------------------
+_originals   = {}   # เก็บ original functions ก่อน patch
+main_window  = None  # reference ถึง MyWindow (set จาก main.py)
+control_room = None  # reference ถึง ControlRoomWindow (set จาก main.py)
 
 
 # ---------------------------------------------------------------------------
@@ -136,6 +143,41 @@ def apply_sim():
     import modules.zaber.motion as motion
     import modules.eudaq as eudaq
 
+    # -- save originals (first call only) ------------------------------------
+    if not _originals:
+        import modules.window as _w
+        import modules.ui.run as _r
+        import modules.ui.phantom as _p
+        import modules.ui.run_progress as _rp
+        import main as _m
+        _originals.update({
+            'serial.Serial':                serial.Serial,
+            'sc.get_port':                  sc.get_port,
+            'fpga.check_connection':        fpga.check_connection,
+            'alpide.found_daqs':            alpide.found_daqs,
+            'alpide.is_programmed':         alpide.is_programmed,
+            'zaber_connect.connect':        zaber_connect.connect,
+            'motion.get_current_locations': motion.get_current_locations,
+            'motion.to_home':               motion.to_home,
+            'motion.apply_move':            motion.apply_move,
+            'motion.apply_step':            motion.apply_step,
+            'motion.apply_steps':           motion.apply_steps,
+            'motion.apply_steps_loop':      motion.apply_steps_loop,
+            'eudaq.default_run':            eudaq.default_run,
+            'eudaq.stop':                   eudaq.stop,
+            'eudaq.install_firware':        eudaq.install_firware,
+            'eudaq.monitor':                eudaq.monitor,
+            'eudaq.gen_its3_ini':           eudaq.gen_its3_ini,
+            'eudaq.gen_its3_conf':          eudaq.gen_its3_conf,
+            'RunWidget.enable_beam':        _r.RunWidget.enable_beam,
+            'rp.apply_steps_loop':          _rp.apply_steps_loop,
+            'rp.get_current_locations':     _rp.get_current_locations,
+        })
+        for _mod, _key in [(_w, 'w.get_port'), (_r, 'r.get_port'), (_p, 'p.get_port'),
+                            (_rp, 'rp.get_port'), (_m, 'm.get_port')]:
+            if hasattr(_mod, 'get_port'):
+                _originals[_key] = getattr(_mod, 'get_port')
+
     # -- serial port detection -----------------------------------------------
     # patch ทั้ง module หลัก และทุก module ที่ทำ "from ... import get_port" ไปแล้ว
     _fake_port = lambda device: f"/dev/ttyUSB_SIM_{device}"
@@ -151,17 +193,20 @@ def apply_sim():
             setattr(_mod, "get_port", _fake_port)
 
     # -- FPGA ----------------------------------------------------------------
-    fpga.check_connection = lambda port: True
+    fpga.check_connection = lambda port: False  # เริ่มต้นเป็น False → ปุ่ม FPGA แดง
 
     # -- ALPIDE --------------------------------------------------------------
-    alpide.found_daqs = lambda: True
+    alpide.found_daqs = lambda: False   # เริ่มต้นเป็น False → ปุ่ม ALPIDE แดง
     alpide.is_programmed = lambda: True
 
     # -- serial.Serial (used in enable_beam / main cleanup) ------------------
     serial.Serial = _MockSerial
 
     # -- Zaber connection ----------------------------------------------------
-    zaber_connect.connect = lambda port: _mock_conn
+    # เริ่มต้นให้ raise error → check_zaber() คืน False → ปุ่ม Zaber แดง
+    def _zaber_disconnected(port):
+        raise ConnectionError("Zaber not connected (sim)")
+    zaber_connect.connect = _zaber_disconnected
 
     # -- Zaber motion --------------------------------------------------------
     def _get_loc(conn):
@@ -387,19 +432,28 @@ def apply_sim():
     def _sim_enable_beam(self):
         from PyQt5.QtCore import Qt
         from PyQt5.QtWidgets import QMessageBox
+        if self._enable_checkbox.isChecked():
+            if not (self._window._alpide_connect and self._window._zaber_connect and self._window._fpga_connect):
+                msg = QMessageBox()
+                msg.setIcon(QMessageBox.Warning)
+                msg.setText("Not all devices connected")
+                msg.setInformativeText("Please connect ALPIDE, Zaber, and FPGA before enabling.")
+                msg.setWindowTitle("Warning")
+                msg.exec_()
+                self._enable_checkbox.setChecked(False)
+                return
         self._ser = _MockSerial()
         self._kill_beam_btn.setChecked(False)
         if self._enable_checkbox.checkState() == Qt.Checked:
             _log.info("Beam ENABLED")
-            rsync_dest = self._rsync_label.text() if self._rsync_label.text() != "rsync destination not set" else ""
-            has_rsync = bool(rsync_dest)
+            has_rsync = bool(self._rsync_addr_edit.text().strip() and self._rsync_path_edit.text().strip())
             self._kill_beam_btn.setEnabled(has_rsync)
             self._launch_eudaq_default.setEnabled(has_rsync)
             if not has_rsync:
                 msg = QMessageBox()
                 msg.setIcon(QMessageBox.Warning)
                 msg.setText("rsync destination is empty")
-                msg.setInformativeText("Please fill in the rsync destination before running.")
+                msg.setInformativeText("Please fill in SSH address and remote path, then click Connect.")
                 msg.setWindowTitle("Warning")
                 msg.exec_()
             self._window.running(True)
@@ -426,10 +480,75 @@ def apply_sim():
 
     _rp_mod.RunProgress.closeEvent = _sim_close_event
 
-    # control_room จะถูกสร้างใน main.py หลัง QApplication init แล้ว
-    import modules.sim as _self_mod
-    _self_mod.control_room = None
-
     _log.info("=" * 40)
     _log.info("SIM MODE — ไม่ต้องต่ออุปกรณ์จริง")
     _log.info("=" * 40)
+
+
+# ---------------------------------------------------------------------------
+# Hardware mode — restore real hardware (beam ยัง sim ผ่าน Control Room)
+# ---------------------------------------------------------------------------
+
+def apply_hw_mode():
+    """Restore real hardware connections — beam stays simulated via Control Room."""
+    if not _originals:
+        _log.warning("apply_hw_mode: no originals saved")
+        return
+
+    import serial
+    import modules.serial_connect as sc
+    import modules.fpga.connect as fpga
+    import modules.alpide as alpide
+    import modules.zaber.connect as zaber_connect
+    import modules.zaber.motion as motion
+    import modules.eudaq as eudaq
+    import modules.ui.run as _run_mod
+    import modules.ui.run_progress as _rp_mod
+    import modules.window as _window_mod
+    import modules.ui.phantom as _ph_mod
+    import main as _main_mod
+
+    serial.Serial                       = _originals['serial.Serial']
+    sc.get_port                         = _originals['sc.get_port']
+    fpga.check_connection               = _originals['fpga.check_connection']
+    alpide.found_daqs                   = _originals['alpide.found_daqs']
+    alpide.is_programmed                = _originals['alpide.is_programmed']
+    zaber_connect.connect               = _originals['zaber_connect.connect']
+    motion.get_current_locations        = _originals['motion.get_current_locations']
+    motion.to_home                      = _originals['motion.to_home']
+    motion.apply_move                   = _originals['motion.apply_move']
+    motion.apply_step                   = _originals['motion.apply_step']
+    motion.apply_steps                  = _originals['motion.apply_steps']
+    motion.apply_steps_loop             = _originals['motion.apply_steps_loop']
+    eudaq.default_run                   = _originals['eudaq.default_run']
+    eudaq.stop                          = _originals['eudaq.stop']
+    eudaq.install_firware               = _originals['eudaq.install_firware']
+    eudaq.monitor                       = _originals['eudaq.monitor']
+    eudaq.gen_its3_ini                  = _originals['eudaq.gen_its3_ini']
+    eudaq.gen_its3_conf                 = _originals['eudaq.gen_its3_conf']
+    _run_mod.RunWidget.enable_beam      = _originals['RunWidget.enable_beam']
+    _rp_mod.apply_steps_loop            = _originals['rp.apply_steps_loop']
+    _rp_mod.get_current_locations       = _originals['rp.get_current_locations']
+
+    for _mod, _key in [(_window_mod, 'w.get_port'), (_run_mod, 'r.get_port'),
+                        (_ph_mod, 'p.get_port'), (_rp_mod, 'rp.get_port'),
+                        (_main_mod, 'm.get_port')]:
+        if _key in _originals:
+            setattr(_mod, 'get_port', _originals[_key])
+
+    _log.info("=" * 40)
+    _log.info("HW MODE — ต่ออุปกรณ์จริง (beam ยัง sim)")
+    _log.info("=" * 40)
+
+    if main_window is not None:
+        main_window.init_connect_devices()
+
+
+def apply_sim_mode():
+    """Re-apply all mocks (กลับมา full sim)."""
+    apply_sim()
+    _log.info("=" * 40)
+    _log.info("SIM MODE — กลับมา mock ทุกอย่าง")
+    _log.info("=" * 40)
+    if main_window is not None:
+        main_window.init_connect_devices()

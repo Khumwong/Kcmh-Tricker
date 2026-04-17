@@ -118,6 +118,8 @@ if __name__ == "__main__":
         _sim_mod.control_room.show()
 
     w = MyWindow()
+    if sim_mode:
+        _sim_mod.main_window = w
     w.showMaximized()
     app.exec_()
 
