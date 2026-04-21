@@ -2083,7 +2083,7 @@ class RunWidget(QWidget):
                         print(f"[log] ERROR: {r.stderr.decode(errors='replace').strip()}")
                     # step 2: SSH append run_with_stats output
                     cmd = (
-                        f'~/sutpct-env/bin/python3 "{remote_wrapper}"'
+                        f'set -o pipefail; ~/sutpct-env/bin/python3 "{remote_wrapper}"'
                         f' "{remote_raw}" -o "{remote_root}"'
                         f' 2>&1 | tee -a "{remote_log}"'
                     )
