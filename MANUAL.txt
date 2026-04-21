@@ -1,0 +1,324 @@
+========================================================
+  KCMH Zaber Trigger — คู่มือการใช้งานฉบับสมบูรณ์
+========================================================
+
+ระบบควบคุม proton beam + ALPIDE detector + Zaber stage + FPGA trigger
+สำหรับการทดลองที่ KCMH (King Chulalongkorn Memorial Hospital)
+
+========================================================
+สารบัญ
+========================================================
+
+  1. การเปิดโปรแกรม
+  2. หน้าจอหลัก — Header Bar
+  3. หน้าจอหลัก — แผงซ้าย (Phantom + Terminal)
+  4. หน้าจอหลัก — แผงขวา (ตั้งค่า Run)
+  5. หน้าจอหลัก — Footer (ปุ่มควบคุม)
+  6. Run Progress (ระหว่าง Run)
+  7. Control Room (Sim Mode เท่านั้น)
+  8. Firmware Toast
+  9. rsync Toast
+  10. ขั้นตอนการ Run ทั้งหมด (ตั้งแต่ต้นจนจบ)
+  11. Auto Kill Beam
+  12. ไฟล์ config.json
+  13. ข้อจำกัดและข้อควรระวัง
+
+========================================================
+1. การเปิดโปรแกรม
+========================================================
+
+  ปกติ (ต่ออุปกรณ์จริง):
+    python main.py
+
+  Simulation Mode (ไม่ต้องต่ออุปกรณ์ — ใช้สำหรับทดสอบ/ฝึก):
+    python main.py --sim
+
+  เมื่อปิดโปรแกรม (ปกติ):
+    - โปรแกรมส่ง 0x00 ไปยัง FPGA เพื่อ reset state
+    - ลบ tmux session "ITS3" อัตโนมัติ
+
+========================================================
+2. Header Bar (แถบด้านบน)
+========================================================
+
+  [ALPIDE]  [Zaber]  [FPGA]
+  ─────────────────────────────
+  - ปุ่มสีแดง  = ไม่ได้ต่อ
+  - ปุ่มสีเขียว = ต่ออยู่
+  - กดเพื่อตรวจสอบการเชื่อมต่อใหม่
+
+  ● Firmware Label
+  ─────────────────────────────
+  - "● No DAQ found"         (แดง)  = ไม่พบ ALPIDE DAQ
+  - "⟳ Firmware Installing"  (เหลือง) = กำลังติดตั้ง firmware
+  - "● Firmware Installed"   (เขียว) = พร้อมใช้งาน
+
+  rsync Status
+  ─────────────────────────────
+  - แสดงสถานะการเชื่อมต่อ SSH/rsync
+  - เปลี่ยนเป็นสีเขียวเมื่อ Connect สำเร็จ
+
+  🔔 ปุ่ม Bell (แจ้งเตือน)
+  ─────────────────────────────
+  - กดเพื่อดูประวัติ toast ทั้งหมด
+    (firmware install, rsync, run complete ฯลฯ)
+  - มีจุดแดงเมื่อมีแจ้งเตือนใหม่
+
+========================================================
+3. แผงซ้าย — Phantom Motor Control + Terminal
+========================================================
+
+  ─── Phantom Motor Control ───
+
+  ตำแหน่งปัจจุบัน (แสดง real-time):
+    X: __ mm    Y: __ mm    R: __ °
+
+  ฟิลด์ "Go to":
+    X (mm)   → ขอบเขต: 0–150 mm
+    Y (mm)   → ขอบเขต: 0–40 mm
+    R (°)    → ไม่จำกัด
+
+  ปุ่ม:
+    [Home]   → ย้ายไป (0, 0, 0)
+    [Center] → ย้ายไป (99, 0, 0)  — จุดกลาง scan
+    [Apply]  → ย้ายไปยังตำแหน่งที่กรอก (ต้องกรอกตัวเลขให้ครบก่อน)
+
+  ─── Embedded Terminal ───
+
+  - แสดง output ของ tmux session "ITS3" แบบ real-time
+  - อัปเดตทุก 400ms
+  - เริ่มทำงานหลังกด "Launch default"
+  - ประกอบด้วย: Run Control, ALPIDE producers,
+    Data Collector, Logger, htop
+
+========================================================
+4. แผงขวา — ตั้งค่า Run
+========================================================
+
+  ─── Output Configuration ───
+
+  [output]          → เลือก folder สำหรับบันทึกไฟล์ .raw
+  SSH Address       → เช่น user@192.168.x.x
+  Remote Path       → เช่น /home/user/data
+  [Connect]         → เชื่อมต่อ SSH สำหรับ rsync
+                      (โปรแกรมถามรหัสผ่านถ้าไม่ใช้ SSH key)
+                      สร้าง folder: raw/ root/ scripts/ log/
+
+  ─── Controller Settings ───
+
+  Exposure time (ms)   → เวลาต่อ 1 loop  (1–100000)
+  Beam delay (ms)      → หน่วงเวลาก่อน trigger  (0–255)
+  Loops                → จำนวนรอบ (ต้องน้อยกว่า Exposure time)
+  Trigger Freq. (Hz)   → ความถี่ readout ALPIDE  (1–95000)
+  X step (mm)          → ระยะเลื่อนแกน X ต่อ loop
+  Y step (mm)          → ระยะเลื่อนแกน Y ต่อ loop
+  R step (°)           → มุมหมุนต่อ loop
+
+  ☐ Enable             → เปิดใช้ KCMH proton beam
+                         (ต้องต่ออุปกรณ์ครบ + ตั้ง rsync ก่อน)
+
+  ─── EUDAQ Parameters ───
+
+  # ALPIDEs            → จำนวน sensor  (1–6)
+  Events               → จำนวน event ต่อ run  (เช่น 30000)
+  STROBE               → integration window  (100–500)
+  I Threshold          → noise threshold  (1–400)
+  Energy (MeV)         → พลังงาน beam  (70–220)
+  MU                   → Monitor Units  (10–10000)
+  Current (nA)         → กระแส beam  (4–300)
+
+  หมายเหตุ: ทุกฟิลด์บันทึกลง config.json อัตโนมัติ
+            วางเมาส์ค้างที่ฟิลด์เพื่อดู tooltip ขอบเขตค่า
+
+========================================================
+5. Footer — ปุ่มควบคุมหลัก
+========================================================
+
+  [Launch default]
+  ─────────────────────────────
+  - เปิดใช้ได้เมื่อ: Enable ติ๊กอยู่ + rsync ต่อแล้ว
+  - สร้าง tmux session "ITS3" (rc, rp, dp, sp, dc, log, perf)
+  - เริ่ม EUDAQ data acquisition
+  - เปิด Run Progress section
+
+  [Kill beam]
+  ─────────────────────────────
+  - ปุ่มสีแดง, ปุ่มกด/ปล่อย (toggle)
+  - เปิดใช้ได้เมื่อ Enable ติ๊กอยู่
+  - กด = ส่ง 0xFE ไป FPGA (หยุด beam)
+  - ดูหัวข้อ 11 สำหรับ Auto Kill Beam
+
+  ☐ Auto kill beam (10s)
+  ─────────────────────────────
+  - อยู่ใต้ปุ่ม Kill beam
+  - ดูหัวข้อ 11
+
+========================================================
+6. Run Progress (ระหว่าง Run)
+========================================================
+
+  แสดงผลหลังกด "Launch default" — หายไปเมื่อ run จบ
+
+  Progress bar    → 0–100% ต่อ loop
+  X / Y / R       → ตำแหน่ง phantom real-time
+  [Run]           → เริ่ม loop ถัดไป
+  [Stop]          → หยุด run
+
+  ─── หลัง Run จบ ───
+
+  1. rsync .raw ไปยัง remote server (มี toast แสดงความคืบหน้า)
+  2. รัน run_with_stats.py บน remote เพื่อแปลง .raw → .root
+  3. rsync program log กลับมา
+  4. ขึ้น toast "Run complete ✓"
+  5. ปุ่ม Kill beam เปิดใช้งาน (และเริ่ม auto-kill countdown ถ้าติ๊กไว้)
+
+========================================================
+7. Control Room Window (--sim เท่านั้น)
+========================================================
+
+  หน้าต่างแยกสำหรับ simulate การส่ง beam
+
+  ─── Status Indicators ───
+
+  ● READY    (เหลือง) = beam พร้อม
+  ● BEAM ON  (แดง)   = beam กำลังส่ง
+  ● DONE     (เขียว) = ส่งครบแล้ว
+
+  ─── Beam Configuration ───
+
+  Planned MU    → จำนวน Monitor Units ที่ต้องการส่ง
+  MU / min      → อัตราการส่ง MU ต่อนาที
+
+  ─── MU Counter ───
+
+  แสดง "ค่าปัจจุบัน / ค่าเป้าหมาย" แบบ real-time
+
+  ─── ขั้นตอนการควบคุม beam (Sim) ───
+
+  1. [PREPARE]  → รอ 3 วินาที, สถานะ → เหลือง
+  2. [READY]    → เปิดใช้ BEAM ON
+  3. [BEAM ON]  → เริ่มส่ง MU, counter เพิ่มขึ้น
+  4. ครบ MU    → สถานะ → เขียว "● Beam Off — Done"
+
+  ─── Device Controls (Sim) ───
+
+  [Connect DAQ]    / [Disconnect DAQ]    → toggle ALPIDE mock
+  [Connect Zaber]  / [Disconnect Zaber]  → toggle motor mock
+  [Connect FPGA]   / [Disconnect FPGA]   → toggle FPGA mock
+
+  (ปุ่มสีเขียว = connected, สีเทาเข้ม = disconnected)
+
+========================================================
+8. Firmware Toast
+========================================================
+
+  - ปรากฏอัตโนมัติเมื่อโปรแกรมตรวจพบ ALPIDE DAQ
+  - Modal popup — ปิดเองเมื่อติดตั้งเสร็จ
+  - แสดง progress bar แบบ animated
+  - เสร็จแล้ว: "✓ Firmware installed successfully" → ปิดใน 2 วินาที
+  - ห้ามถอด USB ระหว่างที่ toast นี้แสดงอยู่
+
+========================================================
+9. rsync Toast
+========================================================
+
+  - ปรากฏอัตโนมัติหลัง run จบ ขณะส่งไฟล์ไป remote
+  - Non-modal — ยังใช้หน้าต่างหลักได้
+  - แสดง: ชื่อไฟล์, progress bar, ความเร็ว (MB/s)
+  - สำเร็จ: border เปลี่ยนเป็นเขียว → ปิดใน 2 วินาที
+  - ล้มเหลว: border เปลี่ยนเป็นแดง + แสดง error → ปิดใน 3 วินาที
+
+========================================================
+10. ขั้นตอนการ Run ทั้งหมด (ตั้งแต่ต้นจนจบ)
+========================================================
+
+  ก่อน Run — Checklist:
+  ─────────────────────────────
+  ☐ ALPIDE, Zaber, FPGA ต่อครบ (ปุ่มเขียว)
+  ☐ Firmware ติดตั้งแล้ว ("● Firmware Installed")
+  ☐ เลือก output folder แล้ว
+  ☐ กรอก SSH address + remote path + กด Connect
+  ☐ กรอกค่าทุก field ให้ครบถ้วน
+  ☐ ย้าย phantom ไป home (0,0,0) หรือตำแหน่งที่ต้องการ
+
+  ขั้นตอน:
+  ─────────────────────────────
+  1.  ตั้งค่า experiment parameters ทั้งหมด
+  2.  ติ๊ก Enable checkbox → beam เปิด, Launch default เปิดใช้
+  3.  กด [Launch default] → EUDAQ session เริ่ม
+  4.  (Sim) ใน Control Room: กด PREPARE → READY → BEAM ON
+  5.  กด [Run] ใน Run Progress เพื่อเริ่ม loop แรก
+  6.  รอ progress bar → motors เลื่อน → loop ถัดไป
+  7.  Run Progress ปิดตัวเองเมื่อครบ loops
+  8.  rsync ส่งไฟล์ไป remote (มี toast)
+  9.  remote แปลง .raw → .root (อัตโนมัติ background)
+  10. กด [Kill beam] หรือรอ auto-kill (ถ้าติ๊กไว้)
+
+========================================================
+11. Auto Kill Beam
+========================================================
+
+  ปุ่ม Kill beam:
+  ─────────────────────────────
+  - เปิดใช้ได้เมื่อ Enable ติ๊กอยู่
+  - ทุกครั้งที่ run จบ ปุ่มจะเริ่มกะพริบสีส้ม/แดง
+    เพื่อเตือนว่า beam ยังค้างอยู่
+
+  Checkbox "Auto kill beam (10s)":
+  ─────────────────────────────
+
+  [ ] ไม่ติ๊ก  → กะพริบเตือนเท่านั้น ไม่ auto-kill
+                  ต้องกด Kill beam เอง
+
+  [✓] ติ๊กไว้  → กะพริบ + ปุ่มแสดง "Kill beam (9s)"
+                  นับถอยหลังทุกวินาที
+                  ครบ 10 วิ = kill beam อัตโนมัติ
+
+  ยกเลิก countdown:
+    กด Kill beam ก่อนครบ 10 วิ → countdown หยุดทันที
+
+  หมายเหตุ:
+    - default ของ checkbox คือ ไม่ติ๊ก (ปลอดภัย)
+    - ต้องมี Enable และ FPGA พร้อมก่อน Kill beam ทำงาน
+
+========================================================
+12. ไฟล์ config.json
+========================================================
+
+  บันทึก/โหลดอัตโนมัติเมื่อเปิด-ปิดโปรแกรม
+
+  ข้อมูลที่บันทึก:
+    - outpath          : output folder
+    - rsync_address    : SSH address
+    - rsync_path       : remote path
+    - fields           : ค่า 14 parameters (ALPIDE, events,
+                         energy, MU, steps ฯลฯ)
+    - ctrl_fields      : Planned MU, MU/min (sim mode)
+
+========================================================
+13. ข้อจำกัดและข้อควรระวัง
+========================================================
+
+  Phantom motion:
+    - X: 0–150 mm  (เกินจะมี warning dialog)
+    - Y: 0–40 mm   (เกินจะมี warning dialog)
+    - R: ไม่จำกัด
+
+  Beam:
+    - ต้อง Enable ก่อนเสมอ
+    - Kill beam ทำงานได้เฉพาะเมื่อ Enable และ FPGA พร้อม
+    - อย่าถอด FPGA USB ระหว่าง Enable อยู่
+
+  EUDAQ:
+    - ต้อง rsync พร้อมก่อนจึงจะ Launch default ได้
+    - ไฟล์ .raw จะถูก timestamp อัตโนมัติ
+    - remote monitor job (.raw → .root) ทำงาน background
+      อาจใช้เวลาสักครู่หลัง run จบ
+
+  Serial port (DB-9 / FPGA):
+    - โปรแกรมจัดการ port เปิด/ปิดอัตโนมัติ
+    - อย่าแก้ไขการตั้งค่า serial โดยตรง
+
+========================================================
+  KCMH Zaber Trigger — v1.0  |  PCT / ITS3 Group
+========================================================

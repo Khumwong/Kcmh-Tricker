@@ -192,16 +192,6 @@ class RunProgress(QObject):
         force_stop = False
         self._is_running = False
         self._conn.close()
-        # disconnect beam signals ก่อน stop_run เพื่อป้องกัน force_stop leak
-        try:
-            import modules.sim as _sim
-            if _sim.control_room is not None:
-                try:
-                    _sim.control_room.beam_off_signal.disconnect(self._on_ctrl_beam_off)
-                except TypeError:
-                    pass
-        except (ImportError, AttributeError):
-            pass
         self._window.stop_run()
     
         
@@ -240,7 +230,6 @@ class RunProgress(QObject):
                 loops=int(self._window._line_edits["Loops"].text())
             )
             # ไม่เรียก _ctrl.reset() ที่นี่ — reset ถูกเรียกใน launch_eudaq() แล้ว
-            _ctrl.beam_off_signal.connect(self._on_ctrl_beam_off)
             self._run_btn.setEnabled(False)
             self._stop_btn.setEnabled(True)
             if _ctrl._beam_active:
@@ -256,11 +245,6 @@ class RunProgress(QObject):
             _rp_log(f"sim not available ({e}), starting immediately")
         # ── non-sim: เริ่ม worker ทันที ──────────────────────────────────
         self._start_worker()
-
-    def _on_ctrl_beam_off(self):
-        """Control Room กด Beam Off → force stop"""
-        global force_stop
-        force_stop = True
 
     def _start_worker(self):
         global force_stop

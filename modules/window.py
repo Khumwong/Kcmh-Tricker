@@ -95,8 +95,20 @@ class MyWindow(QMainWindow):
         all_connect.setStatusTip('Connect all devices')
         all_connect.triggered.connect(lambda x: self.reconnect_devices("all"))
 
+        createPlanAction = QAction('Create Plan...', self)
+        createPlanAction.setStatusTip('Create a new run plan (CSV)')
+        createPlanAction.triggered.connect(lambda: self.run_widget_fn("CreatePlan"))
+
+        loadPlanAction = QAction('Load Plan...', self)
+        loadPlanAction.setStatusTip('Load a run plan from CSV')
+        loadPlanAction.triggered.connect(lambda: self.run_widget_fn("LoadPlan"))
+
+        closePlanAction = QAction('Close Plan', self)
+        closePlanAction.setStatusTip('Close current plan')
+        closePlanAction.triggered.connect(lambda: self.run_widget_fn("ClosePlan"))
+
         menubar = self.menuBar()
-        
+
         fileMenu = menubar.addMenu('&File')
         fileMenu.addAction(newAction)
         fileMenu.addAction(openAction)
@@ -108,6 +120,12 @@ class MyWindow(QMainWindow):
         monitorFile.addAction(viewRecentAction)
         monitorFile.addAction(viewFile)
         monitorFile.addAction(expRoot)
+
+        planMenu = menubar.addMenu('&Plan')
+        planMenu.addAction(createPlanAction)
+        planMenu.addAction(loadPlanAction)
+        planMenu.addSeparator()
+        planMenu.addAction(closePlanAction)
                 
         # connectionMenu = menubar.addMenu('&Connection')
         # connectionMenu.addAction(alpide_connect)
@@ -191,6 +209,12 @@ class MyWindow(QMainWindow):
             self._run_widget.viewRawFile()
         elif menu == "ExportROOT":
             self._run_widget.exportToRoot()
+        elif menu == "CreatePlan":
+            self._run_widget.create_plan()
+        elif menu == "LoadPlan":
+            self._run_widget.load_plan()
+        elif menu == "ClosePlan":
+            self._run_widget.close_plan()
     
     def set_run_ph_loc(self, loc):
         self._run_widget.set_ph_loc(loc)
@@ -207,6 +231,9 @@ class MyWindow(QMainWindow):
                 v.setDisabled(True)
             for ledit in rw._line_edits.values():
                 ledit.setDisabled(True)
+            # lock plan panel — cannot switch runs while beam is enabled
+            rw._plan_table.setDisabled(True)
+            rw._load_run_btn.setDisabled(True)
         else:
             rw._phantom_card.setDisabled(False)
             rw._outpath_btn.setDisabled(False)
@@ -217,3 +244,7 @@ class MyWindow(QMainWindow):
                 v.setDisabled(False)
             for ledit in rw._line_edits.values():
                 ledit.setDisabled(False)
+            # unlock plan panel
+            rw._plan_table.setDisabled(False)
+            if rw._plan_table.currentRow() >= 0:
+                rw._load_run_btn.setEnabled(True)

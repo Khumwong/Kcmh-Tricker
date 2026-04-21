@@ -444,6 +444,7 @@ def apply_sim():
                 return
         self._ser = _MockSerial()
         self._kill_beam_btn.setChecked(False)
+        self._stop_auto_kill_sequence()
         if self._enable_checkbox.checkState() == Qt.Checked:
             _log.info("Beam ENABLED")
             has_rsync = bool(self._rsync_addr_edit.text().strip() and self._rsync_path_edit.text().strip())
@@ -458,7 +459,49 @@ def apply_sim():
                 msg.exec_()
             self._window.running(True)
         else:
+            from PyQt5.QtWidgets import QMessageBox
+            beam_dialog = QMessageBox()
+            beam_dialog.setIcon(QMessageBox.Warning)
+            beam_dialog.setText("Beam status before disabling?")
+            beam_dialog.setInformativeText("กด 'Kill beam' ถ้า beam ยังค้างอยู่\nกด 'Beam หมดแล้ว' ถ้า beam หมดแล้ว")
+            beam_dialog.setWindowTitle("Beam check")
+            kill_btn = beam_dialog.addButton("Kill beam", QMessageBox.DestructiveRole)
+            kill_btn.setStyleSheet("background-color: #c62828; color: white; font-weight: bold; padding: 6px 16px;")
+            done_btn = beam_dialog.addButton("Continue", QMessageBox.AcceptRole)
+            done_btn.setStyleSheet("background-color: #2e7d32; color: white; font-weight: bold; padding: 6px 16px;")
+            cancel_btn = beam_dialog.addButton("Cancel", QMessageBox.RejectRole)
+            cancel_btn.setStyleSheet("background-color: #f9a825; color: white; font-weight: bold; padding: 6px 16px;")
+            beam_dialog.exec_()
+            clicked = beam_dialog.clickedButton()
+            if clicked == kill_btn:
+                if self._ser:
+                    self._ser.write(b'\xFE')
+                import modules.sim as _sim_ref
+                _cr = _sim_ref.control_room
+                if _cr is not None:
+                    def _do_disable():
+                        try:
+                            _cr.beam_off_signal.disconnect(_do_disable)
+                        except TypeError:
+                            pass
+                        _log.info("Beam DISABLED")
+                        self._stop_auto_kill_sequence()
+                        self._kill_beam_btn.setEnabled(False)
+                        self._launch_eudaq_default.setEnabled(False)
+                        self._ser = None
+                        self._window.running(False)
+                    _cr.beam_off_signal.connect(_do_disable)
+                    _cr.start_residual_delivery()
+                    return
+            elif clicked == done_btn:
+                pass
+            else:
+                self._enable_checkbox.blockSignals(True)
+                self._enable_checkbox.setChecked(True)
+                self._enable_checkbox.blockSignals(False)
+                return
             _log.info("Beam DISABLED")
+            self._stop_auto_kill_sequence()
             self._kill_beam_btn.setEnabled(False)
             self._launch_eudaq_default.setEnabled(False)
             self._ser = None
