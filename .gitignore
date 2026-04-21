@@ -8,7 +8,6 @@ output/
 !output/sim/sample.raw
 logs.txt
 run0.root
-StdEventMonitor_fast.py
 # machine-specific config
 config.json
 
