@@ -2085,7 +2085,7 @@ class RunWidget(QWidget):
                     cmd = (
                         f'~/sutpct-env/bin/python3 "{remote_wrapper}"'
                         f' "{remote_raw}" -o "{remote_root}"'
-                        f' >> "{remote_log}" 2>&1'
+                        f' >> "{remote_log}"'
                     )
                     print(f"[monitor] SSH → {rsync_addr}: {cmd}")
                     if password:
