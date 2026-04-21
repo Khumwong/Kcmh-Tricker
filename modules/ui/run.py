@@ -2091,12 +2091,12 @@ class RunWidget(QWidget):
                     if password:
                         result = subprocess.run(
                             ['sshpass', '-p', password, 'ssh'] + _pwd_ssh_opts + [rsync_addr, cmd],
-                            stdout=subprocess.DEVNULL, stderr=subprocess.PIPE
+                            stdout=subprocess.PIPE, stderr=subprocess.STDOUT
                         )
                     else:
                         result = subprocess.run(
                             ['ssh'] + _key_ssh_opts + [rsync_addr, cmd],
-                            stdout=subprocess.DEVNULL, stderr=subprocess.PIPE
+                            stdout=subprocess.PIPE, stderr=subprocess.STDOUT
                         )
                     if result.returncode == 0:
                         print(f"[monitor] done → {remote_root}")
@@ -2104,7 +2104,7 @@ class RunWidget(QWidget):
                             Qt.ConnectionType.QueuedConnection,
                             Q_ARG(str, "ok"), Q_ARG(str, f"{fname_base}.root"))
                     else:
-                        err_msg = result.stderr.decode(errors='replace').strip()
+                        err_msg = result.stdout.decode(errors='replace').strip()
                         print(f"[monitor] ERROR: {err_msg}")
                         QMetaObject.invokeMethod(self, "_monitor_done_slot",
                             Qt.ConnectionType.QueuedConnection,
