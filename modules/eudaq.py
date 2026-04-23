@@ -143,10 +143,13 @@ def default_run(qt_args, outpath):
     process = subprocess.Popen(['bash', '-c', command])
     return process.pid
     
+_ALPIDE_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), '..', 'alpide')
+
 def install_firware():
-    alpide_dir = "/home/santa/alpide-daq-software"
-    command_alpide = f"alpide-daq-program --fx3=./tmp/fx3.img --fpga=./tmp/fpga-v1.0.0.bit --all"
-    command = f'gnome-terminal -- bash -c "cd {alpide_dir} && {command_alpide}; exec bash"'
+    fx3  = os.path.join(_ALPIDE_DIR, 'fx3.img')
+    fpga = os.path.join(_ALPIDE_DIR, 'fpga-v1.0.0.bit')
+    command_alpide = f"alpide-daq-program --fx3={fx3} --fpga={fpga} --all"
+    command = f'gnome-terminal -- bash -c "{command_alpide}; exec bash"'
     process = subprocess.Popen(command, shell=True)
 
 def install_firmware_auto(parent_widget=None):
@@ -155,10 +158,10 @@ def install_firmware_auto(parent_widget=None):
     toast = FirmwareToast(parent=parent_widget)
     toast.show_centered(parent_widget)
 
-    alpide_dir = "/home/santa/alpide-daq-software"
+    fx3  = os.path.join(_ALPIDE_DIR, 'fx3.img')
+    fpga = os.path.join(_ALPIDE_DIR, 'fpga-v1.0.0.bit')
     result = subprocess.run(
-        ["alpide-daq-program", "--fx3=./tmp/fx3.img", "--fpga=./tmp/fpga-v1.0.0.bit", "--all"],
-        cwd=alpide_dir
+        ["alpide-daq-program", f"--fx3={fx3}", f"--fpga={fpga}", "--all"],
     )
     success = result.returncode == 0
     toast.set_done(success)

@@ -12,11 +12,13 @@ run0.root
 config.json
 
 # old/unused files
-alpide/
 structure.txt
 folder_structure.py
 launch_pyqt_app.sh
 *.g4bl
+
+# venv
+.venv/
 
 # IDE
 .vscode/
