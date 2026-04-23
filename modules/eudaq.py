@@ -154,12 +154,24 @@ def install_firware():
 
 def install_firmware_auto(parent_widget=None):
     """รัน firmware installer พร้อม progress popup — block UI จนเสร็จ"""
+    import os
+    from PyQt5.QtWidgets import QMessageBox
     from modules.ui.firmware_toast import FirmwareToast
+
+    alpide_dir = "/home/santa/alpide-daq-software"
+    if not os.path.isdir(alpide_dir):
+        QMessageBox.warning(
+            parent_widget,
+            "Firmware Installer Not Found",
+            f"alpide-daq-software not installed at:\n{alpide_dir}\n\n"
+            "DAQ boards require firmware flashing before use.\n"
+            "Please install alpide-daq-software and update the path in modules/eudaq.py."
+        )
+        return False
+
     toast = FirmwareToast(parent=parent_widget)
     toast.show_centered(parent_widget)
 
-    fx3  = os.path.join(_ALPIDE_DIR, 'fx3.img')
-    fpga = os.path.join(_ALPIDE_DIR, 'fpga-v1.0.0.bit')
     result = subprocess.run(
         ["alpide-daq-program", f"--fx3={fx3}", f"--fpga={fpga}", "--all"],
     )

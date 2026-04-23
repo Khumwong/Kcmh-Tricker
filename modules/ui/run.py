@@ -1825,7 +1825,7 @@ class RunWidget(QWidget):
             self._firmware_label.setText("● No DAQ found")
             self._firmware_label.setStyleSheet(_base + "QLabel { color: #ef5350; }")
         elif not alpide.is_programmed():
-            self._firmware_label.setText("⟳ Firmware Installing")
+            self._firmware_label.setText("⚠ Firmware Not Flashed")
             self._firmware_label.setStyleSheet(_base + "QLabel { color: #ffd740; }")
         else:
             self._firmware_label.setText("● Firmware Installed")
