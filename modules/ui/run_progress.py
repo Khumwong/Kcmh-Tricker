@@ -57,23 +57,45 @@ class ProgressWorker(QRunnable):
             #         trigger_f_byte_list[1]]
             # for b in byte_start_list:
             #     self.kwargs['ser'].write(b)
+            loop = asyncio.new_event_loop()
+            asyncio.set_event_loop(loop)
+            self.kwargs['event_loop'] = loop
+
+            def ser_write(b):
+                try:
+                    self.kwargs['ser'].write(b)
+                except Exception:
+                    try:
+                        self.kwargs['ser'].close()
+                    except Exception:
+                        pass
+                    for _ in range(5):
+                        try:
+                            self.kwargs['ser'] = serial.Serial(
+                                port=get_port("fpga"), baudrate=baudrate,
+                                parity=parity, bytesize=bytesize, stopbits=stopbits, timeout=1)
+                            self.kwargs['ser'].write(b)
+                            # sync กลับไปที่ RunWidget._ser เพื่อให้ kill_beam_action ใช้ port ใหม่ได้
+                            self.kwargs['window']._ser = self.kwargs['ser']
+                            break
+                        except Exception:
+                            time.sleep(0.5)
+
             step_current_datetime = datetime.datetime.now()
             current_time = datetime.datetime.now()
             value = 0
             step = 1
-            self.kwargs['ser'].write(b'\xFE')
+            ser_write(b'\xFE')
             locs = self.kwargs['locs']
             while True:
                 if force_stop:
-                    # apply final step and emit before stopping
                     locs = apply_steps_loop(self.kwargs['conn'], self.kwargs['steps'], self.kwargs['event_loop'])
                     self.signals.progress.emit({"type": "progress", "value": 1000, "locs": locs})
-                    self.kwargs['ser'].write(b'\xEF')
+                    ser_write(b'\xEF')
                     break
 
                 if (datetime.datetime.now() - step_current_datetime).total_seconds() > self.args[1]:
-                    self.kwargs['ser'].write(b'\xEF')
-                    # apply step first, then emit updated position
+                    ser_write(b'\xEF')
                     locs = apply_steps_loop(self.kwargs['conn'], self.kwargs['steps'], self.kwargs['event_loop'])
                     self.signals.progress.emit({"type": "step", "value": step, "locs": locs})
                     value = int(step*1000/self.args[2])
@@ -82,7 +104,7 @@ class ProgressWorker(QRunnable):
                     current_time = datetime.datetime.now()
                     if step > self.args[2]:
                         break
-                    self.kwargs['ser'].write(b'\xFE')
+                    ser_write(b'\xFE')
                 elif (datetime.datetime.now() - current_time).total_seconds() > self.args[0]:
                     value += 1
                     self.signals.progress.emit({"type": "progress", "value": value, "locs": locs})
@@ -132,8 +154,11 @@ class RunProgress(QObject):
     def __init__(self, window, progress_bar, run_btn, stop_btn, ph_locs):
         super().__init__()
         _rp_log("__init__")
-        self._loop = asyncio.get_event_loop()
-        asyncio.set_event_loop(self._loop)
+        try:
+            self._loop = asyncio.get_event_loop()
+        except RuntimeError:
+            self._loop = asyncio.new_event_loop()
+            asyncio.set_event_loop(self._loop)
         self._window = window
         self._ser = window._ser
         self._is_running = True
@@ -146,7 +171,8 @@ class RunProgress(QObject):
         # reset state
         self._progress_bar.setValue(0)
         self._progress_bar.setFormat('')
-        self._run_btn.setEnabled(True)
+        self._run_btn.setEnabled(False)
+        self._run_btn.setText("Waiting for ITS3...")
         self._stop_btn.setEnabled(False)
         # disconnect old connections before re-connecting
         try:
@@ -159,7 +185,36 @@ class RunProgress(QObject):
             pass
         self._run_btn.clicked.connect(self._on_run_clicked)
         self._stop_btn.clicked.connect(self.force_stop)
+        # poll rc.log รอ ITS3 พร้อม
+        from PyQt5.QtCore import QTimer as _QTimer
+        import os as _os
+        self._rc_log_path = _os.path.expanduser("~/eudaq2/user/ITS3/misc/rc.log")
+        self._rc_poll_timer = _QTimer()
+        self._rc_poll_timer.setInterval(500)
+        self._rc_poll_timer.timeout.connect(self._poll_its3_ready)
+        self._rc_poll_timer.start()
         _rp_log("__init__ done")
+
+    def _poll_its3_ready(self):
+        import os as _os
+        try:
+            if not _os.path.exists(self._rc_log_path):
+                return
+            with open(self._rc_log_path, "r", errors="replace") as f:
+                content = f.read()
+            if "StartRun" in content:
+                self._rc_poll_timer.stop()
+                self._run_btn.setEnabled(True)
+                self._run_btn.setText("Run")
+                from PyQt5.QtWidgets import QApplication as _QApp
+                _QApp.beep()
+                try:
+                    self._window._window._run_widget._show_toast(
+                        "ITS3 Ready ✓", "Run can now be started")
+                except Exception:
+                    pass
+        except Exception:
+            pass
             
     def force_stop(self):
         global force_stop
@@ -171,6 +226,11 @@ class RunProgress(QObject):
             step = min(value['value'], self._num_step_loops)
             self._progress_bar.setFormat("{}/{}".format(step, self._num_step_loops))
             self._progress_bar.setValue(int(step * 1000 / self._num_step_loops))
+            # force ITS3 snapshot at end of each loop
+            try:
+                self._window._terminal_widget.force_snapshot()
+            except Exception:
+                pass
             # sync MU ใน Control Room ตาม loop ที่เสร็จแล้ว
             try:
                 import modules.sim as _sim
@@ -258,11 +318,15 @@ class RunProgress(QObject):
         self._start_time = datetime.datetime.now()
         self._is_running = True
         self._stop_btn.setEnabled(True)
+        try:
+            self._window._inline_cancel_btn.setEnabled(False)
+        except AttributeError:
+            pass
         progress_worker = ProgressWorker(time_prog_size, time_step, self._num_step_loops, conn=self._conn,
                                          steps=self._zaber_steps, event_loop=self._event_loop,
             trigger_f_bin=bin(int(self._window._line_edits["Trigger Freq. (Hz)"].text())).lstrip('0b').zfill(16),
             alpide_delay=bin(int(self._window._line_edits["Beam delay (ms)"].text())).lstrip('0b').zfill(8),
-            locs=self._locs, ser=self._ser
+            locs=self._locs, ser=self._ser, window=self._window
             )
         progress_worker.signals.progress.connect(self.update_progress)
         progress_worker.signals.finished.connect(self.progress_finish)

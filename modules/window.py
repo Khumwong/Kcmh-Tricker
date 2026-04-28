@@ -1,5 +1,6 @@
 # modules/windows.py
 from PyQt5.QtWidgets import QMainWindow, QAction, qApp
+from PyQt5.QtCore import QTimer
 from PyQt5.QtGui import QIcon
 
 from modules.ui.run import RunWidget
@@ -219,6 +220,12 @@ class MyWindow(QMainWindow):
     def set_run_ph_loc(self, loc):
         self._run_widget.set_ph_loc(loc)
     
+    def showEvent(self, event):
+        super().showEvent(event)
+        if not hasattr(self, '_size_locked'):
+            self._size_locked = True
+            QTimer.singleShot(0, lambda: self.setFixedSize(self.size()))
+
     def running(self, is_running):
         rw = self._run_widget
         if is_running:

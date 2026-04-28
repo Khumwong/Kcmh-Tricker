@@ -1,7 +1,7 @@
 # modules/ui/rsync_toast.py
 # Non-modal progress popup สำหรับ rsync transfer
 
-from PyQt5.QtWidgets import QDialog, QVBoxLayout, QHBoxLayout, QLabel, QProgressBar, QApplication
+from PyQt5.QtWidgets import QDialog, QVBoxLayout, QHBoxLayout, QLabel, QProgressBar, QPushButton, QApplication
 from PyQt5.QtCore import Qt, QTimer
 from PyQt5.QtGui import QFont
 
@@ -11,6 +11,8 @@ class RsyncToast(QDialog):
 
     def __init__(self, filename, dest_host, parent=None):
         super().__init__(parent)
+        self._proc = None
+        self._cancelled = False
         self.setWindowTitle("Sending file")
         self.setWindowFlags(Qt.Tool | Qt.FramelessWindowHint | Qt.WindowStaysOnTopHint)
         self.setModal(False)
@@ -27,20 +29,17 @@ class RsyncToast(QDialog):
         layout.setContentsMargins(28, 22, 28, 22)
         layout.setSpacing(10)
 
-        # title row
         title = QLabel(f"  Sending to {dest_host}")
         title.setStyleSheet("color: #e0e0e0; font-size: 15px; font-weight: bold;")
         layout.addWidget(title)
 
-        # filename
         self._file_label = QLabel(filename)
         self._file_label.setStyleSheet("color: #8898a8; font-size: 11px; font-family: monospace;")
         self._file_label.setWordWrap(True)
         layout.addWidget(self._file_label)
 
-        # progress bar
         self._bar = QProgressBar()
-        self._bar.setRange(0, 0)  # indeterminate
+        self._bar.setRange(0, 0)
         self._bar.setFixedHeight(12)
         self._bar.setTextVisible(False)
         self._bar.setStyleSheet("""
@@ -57,13 +56,38 @@ class RsyncToast(QDialog):
         """)
         layout.addWidget(self._bar)
 
-        # status row: % + speed
         self._status = QLabel("กรุณารอ...")
         self._status.setStyleSheet("color: #aaa; font-size: 12px; font-family: monospace;")
         self._status.setAlignment(Qt.AlignCenter)
         layout.addWidget(self._status)
 
+        self._cancel_btn = QPushButton("Cancel")
+        self._cancel_btn.setFixedHeight(28)
+        self._cancel_btn.setStyleSheet("""
+            QPushButton {
+                background: transparent; color: #ef5350;
+                border: 1px solid #ef5350; border-radius: 6px;
+                font-size: 12px; padding: 2px 16px;
+            }
+            QPushButton:hover { background: #ef535020; }
+        """)
+        self._cancel_btn.clicked.connect(self._on_cancel)
+        layout.addWidget(self._cancel_btn, alignment=Qt.AlignRight)
+
         self.adjustSize()
+
+    def set_proc(self, proc):
+        self._proc = proc
+
+    def _on_cancel(self):
+        self._cancelled = True
+        if self._proc:
+            try:
+                self._proc.kill()
+            except Exception:
+                pass
+        self.set_done(success=False, detail="Cancelled by user")
+
 
     def show_centered(self, parent=None):
         self.show()

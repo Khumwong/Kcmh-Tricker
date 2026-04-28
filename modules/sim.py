@@ -70,6 +70,9 @@ class _MockAxis:
         self._positions[self._idx] += float(step)
         return _noop()
 
+    def stop_async(self):
+        return _noop()
+
 
 class _MockDevice:
     def __init__(self, positions, idx):
@@ -114,19 +117,20 @@ _mock_conn = MockZaberConnection()
 class _MockSerial:
     """Fake serial port — silently discards writes"""
     def __init__(self, *args, **kwargs):
-        pass
+        self.is_open = True
 
     def write(self, data):
         _log.info(f"FPGA write: 0x{data.hex().upper()}")
 
     def close(self):
+        self.is_open = False
         _log.debug("FPGA serial closed")
 
     def __enter__(self):
         return self
 
     def __exit__(self, *args):
-        pass
+        self.close()
 
 
 # ---------------------------------------------------------------------------
@@ -163,6 +167,7 @@ def apply_sim():
             'motion.apply_step':            motion.apply_step,
             'motion.apply_steps':           motion.apply_steps,
             'motion.apply_steps_loop':      motion.apply_steps_loop,
+            'motion.stop_all':              motion.stop_all,
             'eudaq.default_run':            eudaq.default_run,
             'eudaq.stop':                   eudaq.stop,
             'eudaq.install_firware':        eudaq.install_firware,
@@ -246,6 +251,7 @@ def apply_sim():
     motion.apply_step = _apply_step
     motion.apply_steps = _apply_steps
     motion.apply_steps_loop = lambda conn, steps, loop: _apply_steps(conn, steps)
+    motion.stop_all = lambda conn: _log.info("Zaber stop_all (sim)")
 
     # -- EUDAQ ---------------------------------------------------------------
     _SIM_SERIALS = [

@@ -34,14 +34,13 @@ def to_home(conn: Connection):
     device_rot = conn.get_device(3)
     device_rot.identify()
     
-    coroutine_x = device_x.get_axis(1).home_async()
-    coroutine_y = device_y.get_axis(1).home_async()
-    coroutine_r = device_rot.get_axis(1).home_async()
-    
-    move_coroutine = asyncio.gather(coroutine_x, coroutine_y, coroutine_r)
-
-    loop = asyncio.get_event_loop()
-    loop.run_until_complete(move_coroutine)
+    async def _run():
+        await asyncio.gather(
+            device_x.get_axis(1).home_async(),
+            device_y.get_axis(1).home_async(),
+            device_rot.get_axis(1).home_async(),
+        )
+    asyncio.run(_run())
     
 def apply_move(conn, loc):
     device_x = conn.get_device(1)
@@ -55,16 +54,15 @@ def apply_move(conn, loc):
     device_rot = conn.get_device(3)
     device_rot.identify()
     
-    coroutine_x = device_x.get_axis(1).move_absolute_async(loc[0], unit=zaber_units.Units.LENGTH_MILLIMETRES)
-    coroutine_y = device_y.get_axis(1).move_absolute_async(loc[1], unit=zaber_units.Units.LENGTH_MILLIMETRES)
-    coroutine_r = device_rot.get_axis(1).move_absolute_async(loc[2], unit=zaber_units.Units.ANGLE_DEGREES)
-
-    move_coroutine = asyncio.gather(coroutine_x, coroutine_y, coroutine_r)
-
-    loop = asyncio.get_event_loop()
-    loop.run_until_complete(move_coroutine)
-    return (device_x.get_axis(1).get_position(unit=zaber_units.Units.LENGTH_MILLIMETRES), 
-            device_y.get_axis(1).get_position(unit=zaber_units.Units.LENGTH_MILLIMETRES), 
+    async def _run():
+        await asyncio.gather(
+            device_x.get_axis(1).move_absolute_async(loc[0], unit=zaber_units.Units.LENGTH_MILLIMETRES),
+            device_y.get_axis(1).move_absolute_async(loc[1], unit=zaber_units.Units.LENGTH_MILLIMETRES),
+            device_rot.get_axis(1).move_absolute_async(loc[2], unit=zaber_units.Units.ANGLE_DEGREES),
+        )
+    asyncio.run(_run())
+    return (device_x.get_axis(1).get_position(unit=zaber_units.Units.LENGTH_MILLIMETRES),
+            device_y.get_axis(1).get_position(unit=zaber_units.Units.LENGTH_MILLIMETRES),
             device_rot.get_axis(1).get_position(unit=zaber_units.Units.ANGLE_DEGREES))
     
 def apply_step(conn: Connection, axis, step):
@@ -102,17 +100,15 @@ def apply_steps(conn: Connection, steps):
     device_rot = conn.get_device(3)
     device_rot.identify()
     
-    coroutine_x = device_x.get_axis(1).move_relative_async(steps[0], unit=zaber_units.Units.LENGTH_MILLIMETRES)
-    coroutine_y = device_y.get_axis(1).move_relative_async(steps[1], unit=zaber_units.Units.LENGTH_MILLIMETRES)
-    coroutine_r = device_rot.get_axis(1).move_relative_async(steps[2], unit=zaber_units.Units.ANGLE_DEGREES)
-
-    move_coroutine = asyncio.gather(coroutine_x,coroutine_y,coroutine_r)
-
-    loop = asyncio.get_event_loop()
-    
-    loop.run_until_complete(move_coroutine)
-    return (device_x.get_axis(1).get_position(unit=zaber_units.Units.LENGTH_MILLIMETRES), 
-            device_y.get_axis(1).get_position(unit=zaber_units.Units.LENGTH_MILLIMETRES), 
+    async def _run():
+        await asyncio.gather(
+            device_x.get_axis(1).move_relative_async(steps[0], unit=zaber_units.Units.LENGTH_MILLIMETRES),
+            device_y.get_axis(1).move_relative_async(steps[1], unit=zaber_units.Units.LENGTH_MILLIMETRES),
+            device_rot.get_axis(1).move_relative_async(steps[2], unit=zaber_units.Units.ANGLE_DEGREES),
+        )
+    asyncio.run(_run())
+    return (device_x.get_axis(1).get_position(unit=zaber_units.Units.LENGTH_MILLIMETRES),
+            device_y.get_axis(1).get_position(unit=zaber_units.Units.LENGTH_MILLIMETRES),
             device_rot.get_axis(1).get_position(unit=zaber_units.Units.ANGLE_DEGREES))
     
 def apply_steps_loop(conn: Connection, steps, loop):
@@ -126,15 +122,28 @@ def apply_steps_loop(conn: Connection, steps, loop):
 
     device_rot = conn.get_device(3)
     device_rot.identify()
-    
+
     coroutine_x = device_x.get_axis(1).move_relative_async(steps[0], unit=zaber_units.Units.LENGTH_MILLIMETRES)
     coroutine_y = device_y.get_axis(1).move_relative_async(steps[1], unit=zaber_units.Units.LENGTH_MILLIMETRES)
     coroutine_r = device_rot.get_axis(1).move_relative_async(steps[2], unit=zaber_units.Units.ANGLE_DEGREES)
 
-    move_coroutine = asyncio.gather(coroutine_x,coroutine_y,coroutine_r, loop=loop)
+    asyncio.set_event_loop(loop)
+    move_coroutine = asyncio.gather(coroutine_x,coroutine_y,coroutine_r)
 
     loop.run_until_complete(move_coroutine)
-    return (device_x.get_axis(1).get_position(unit=zaber_units.Units.LENGTH_MILLIMETRES), 
-            device_y.get_axis(1).get_position(unit=zaber_units.Units.LENGTH_MILLIMETRES), 
+    return (device_x.get_axis(1).get_position(unit=zaber_units.Units.LENGTH_MILLIMETRES),
+            device_y.get_axis(1).get_position(unit=zaber_units.Units.LENGTH_MILLIMETRES),
             device_rot.get_axis(1).get_position(unit=zaber_units.Units.ANGLE_DEGREES))
-    
+
+
+def stop_all(conn: Connection):
+    device_x = conn.get_device(1)
+    device_y = conn.get_device(2)
+    device_rot = conn.get_device(3)
+    async def _run():
+        await asyncio.gather(
+            device_x.get_axis(1).stop_async(),
+            device_y.get_axis(1).stop_async(),
+            device_rot.get_axis(1).stop_async(),
+        )
+    asyncio.run(_run())

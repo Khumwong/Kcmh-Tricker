@@ -1,6 +1,7 @@
 # modules/eudaq.py
 import subprocess
 import os
+import signal
 from os import path
 import time
 import glob
@@ -25,7 +26,7 @@ SERIALS = [
     "DAQ-0009042501020714",
     "DAQ-0009042501141325"
         ]
-EUDAQ_DIR = "/home/santa/eudaq2/user/ITS3/misc/"
+EUDAQ_DIR = "/home/kobdaj/eudaq2/user/ITS3/misc/"
 
 def gen_its3_ini(num_alpides):
     alpide_names = [f"ALPIDE_plane_{i}" for i in range(num_alpides)]
@@ -44,7 +45,7 @@ def gen_its3_ini(num_alpides):
             f.write(f"[Producer.ALPIDE_plane_{i}]\n")
             f.write(f"serial      = {SERIALS[i]}\n")
             f.write(f"plane       = {i}\n")
-            f.write(f"triggermode = {'primary' if i == 0 else 'replica'}\n")
+            f.write(f"triggermode = replica #{'primary' if i == 0 else 'replica'}\n")
             f.write("\n") 
 
 def gen_its3_conf(num_alpides, num_evt, strobe_length, i_threshold, outpath):
@@ -84,7 +85,7 @@ def run(fname):
     its3_ini = "ITS3_auto.ini"
     conf = "ITS3-align-6plane-Vbb0-auto.conf"
     conf_gen = "ITS3-align-6plane-Vbb0-auto-gen.conf"
-    eudaq_dir = "/home/santa/eudaq2/user/ITS3/misc/"
+    eudaq_dir = EUDAQ_DIR
     conf_path = path.join(eudaq_dir, conf)
     conf_gen_path = path.join(eudaq_dir, conf_gen)
     with open(conf_path, 'r') as f:
@@ -106,8 +107,8 @@ def stop(pid):
     time.sleep(5)
     subprocess.run(['tmux', 'kill-session', '-t', 'ITS3'])
     try:
-        subprocess.run(['kill', '-9', f"-{pid}"])
-    except:
+        os.killpg(os.getpgid(pid), signal.SIGTERM)
+    except Exception:
         pass
 
     
@@ -134,10 +135,16 @@ def default_run(qt_args, outpath):
                 f.write(line.replace("{num_alpides}", qt_args["num_alpides"].text()))
             else:
                 f.write(f"{line}")
-    eudaq_dir = "/home/santa/eudaq2/user/ITS3/misc/"
+    eudaq_dir = EUDAQ_DIR
     gen_its3_ini(int(qt_args["num_alpides"].text()))
     gen_its3_conf(int(qt_args["num_alpides"].text()), int(qt_args["num_events"].text()), int(qt_args["strobe"].text()),
                    int(qt_args["ithr"].text()), outpath)
+    # clear rc.log ก่อน start ใหม่ เพื่อไม่ให้ poll เจอ log เก่า
+    rc_log = path.join(EUDAQ_DIR, "rc.log")
+    try:
+        open(rc_log, 'w').close()
+    except Exception:
+        pass
     # รัน startup script แบบ headless (script จะสร้าง tmux session ITS3 เอง)
     command = f"cd {eudaq_dir} && bash ./{start_sh_gen}"
     process = subprocess.Popen(['bash', '-c', command])
@@ -152,34 +159,61 @@ def install_firware():
     command = f'gnome-terminal -- bash -c "{command_alpide}; exec bash"'
     process = subprocess.Popen(command, shell=True)
 
+class _FirmwareWorker(object):
+    """รัน alpide-daq-program ใน QThread — emit line_ready / finished"""
+    def __new__(cls, fx3, fpga):
+        from PyQt5.QtCore import QThread, pyqtSignal
+
+        class _Worker(QThread):
+            line_ready = pyqtSignal(str)
+            finished_ok = pyqtSignal(bool)
+
+            def __init__(self, fx3, fpga):
+                super().__init__()
+                self._fx3 = fx3
+                self._fpga = fpga
+                self.success = False
+
+            def run(self):
+                proc = subprocess.Popen(
+                    ["alpide-daq-program", f"--fx3={self._fx3}", f"--fpga={self._fpga}", "--all"],
+                    stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True
+                )
+                for line in proc.stdout:
+                    self.line_ready.emit(line.rstrip())
+                proc.wait()
+                self.success = proc.returncode == 0
+                self.finished_ok.emit(self.success)
+
+        return _Worker(fx3, fpga)
+
 def install_firmware_auto(parent_widget=None):
-    """รัน firmware installer พร้อม progress popup — block UI จนเสร็จ"""
-    import os
     from PyQt5.QtWidgets import QMessageBox
     from modules.ui.firmware_toast import FirmwareToast
 
-    alpide_dir = "/home/santa/alpide-daq-software"
-    if not os.path.isdir(alpide_dir):
+    fx3  = os.path.join(_ALPIDE_DIR, 'fx3.img')
+    fpga = os.path.join(_ALPIDE_DIR, 'fpga-v1.0.0.bit')
+
+    missing = [f for f in [fx3, fpga] if not os.path.isfile(f)]
+    if missing:
         QMessageBox.warning(
             parent_widget,
-            "Firmware Installer Not Found",
-            f"alpide-daq-software not installed at:\n{alpide_dir}\n\n"
-            "DAQ boards require firmware flashing before use.\n"
-            "Please install alpide-daq-software and update the path in modules/eudaq.py."
+            "Firmware Files Not Found",
+            "Firmware files missing:\n" + "\n".join(missing) + "\n\n"
+            f"Copy fx3.img and fpga-v1.0.0.bit to:\n{_ALPIDE_DIR}"
         )
         return False
 
     toast = FirmwareToast(parent=parent_widget)
+    worker = _FirmwareWorker(fx3, fpga)
+    worker.line_ready.connect(toast.append_line)
+    worker.finished_ok.connect(toast.set_done)
+    worker.start()
     toast.show_centered(parent_widget)
-
-    result = subprocess.run(
-        ["alpide-daq-program", f"--fx3={fx3}", f"--fpga={fpga}", "--all"],
-    )
-    success = result.returncode == 0
-    toast.set_done(success)
-    return success
+    toast.exec()
+    return worker.success
 
 def monitor(filepath):
-    std_exc = "/home/santa/eudaq2/bin/StdEventMonitor"
+    std_exc = "/home/kobdaj/eudaq2/bin/StdEventMonitor"
     command = f'gnome-terminal -- bash -c "{std_exc} -d {filepath}; exec bash"'
     process = subprocess.Popen(command, shell=True)

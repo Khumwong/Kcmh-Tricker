@@ -1,6 +1,6 @@
 from PyQt5.QtWidgets import (QMainWindow, QVBoxLayout, QHBoxLayout, QLabel, QPushButton,
                              QWidget, QSlider, QDial, QLineEdit, QMessageBox, QToolButton,
-                             QSpacerItem)
+                             QSpacerItem, QApplication)
 from PyQt5.QtCore import Qt, QSize
 from PyQt5.QtGui import QIcon
 import time
@@ -364,6 +364,7 @@ class PhWidget(QWidget):
         loc = motion.get_current_locations(conn)
         conn.close()
         self.set_all_loc(loc)
+        QApplication.beep()
         # except:
         #     try:
         #         conn = zaber_connect.connect()
