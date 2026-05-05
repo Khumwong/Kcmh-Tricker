@@ -677,10 +677,12 @@ class RunWidget(QWidget):
         )
         self._connection = {"alpide": QPushButton(" ALPIDE"),
                             "zaber": QPushButton(" Zaber"),
-                            "fpga": QPushButton(" FPGA")}
+                            "fpga": QPushButton(" FPGA"),
+                            "camera": QPushButton(" Camera")}
         self._connection["alpide"].clicked.connect(lambda x: self.check_connection("alpide"))
         self._connection["fpga"].clicked.connect(lambda x: self.check_connection("fpga"))
         self._connection["zaber"].clicked.connect(lambda x: self.check_connection("zaber"))
+        self._connection["camera"].clicked.connect(lambda x: self._open_video_window())
         for v in self._connection.values():
             v.setCursor(Qt.CursorShape.PointingHandCursor)
             v.setIconSize(QSize(20, 20))
@@ -1520,20 +1522,50 @@ class RunWidget(QWidget):
         row.addWidget(self._inline_stop_btn)
 
         outer.addLayout(row)
+
+        # MU values row
+        mu_row = QHBoxLayout()
+        mu_row.setSpacing(20)
+        mu_style = "QLabel { font-size: 13px; color: #80d8ff; font-family: monospace; font-weight: bold; }"
+        self._inline_mu_labels = {
+            'mu1':      QLabel("MU1: —"),
+            'mu2':      QLabel("MU2: —"),
+            'mu_rate':  QLabel("Rate: —"),
+            'progress': QLabel("Progress: —"),
+        }
+        for lbl in self._inline_mu_labels.values():
+            lbl.setStyleSheet(mu_style)
+            mu_row.addWidget(lbl)
+        mu_row.addStretch(1)
+        outer.addLayout(mu_row)
+
         return section
+
+    def _on_mu_data(self, entry):
+        mu1  = entry.get('mu1')
+        mu2  = entry.get('mu2')
+        rate = entry.get('mu_rate')
+        prog = entry.get('progress')
+        def _fmt(v): return f'{v:.1f}' if isinstance(v, float) else '—'
+        self._inline_mu_labels['mu1'].setText(f"MU1: {_fmt(mu1)}")
+        self._inline_mu_labels['mu2'].setText(f"MU2: {_fmt(mu2)}")
+        self._inline_mu_labels['mu_rate'].setText(f"Rate: {_fmt(rate)}")
+        self._inline_mu_labels['progress'].setText(f"Progress: {_fmt(prog)}%")
 
     def _show_progress_section(self):
         # sync position labels with current phantom position
         self._inline_ph_locs[0].setText("X: " + self._ph_x_label.text() + " mm")
         self._inline_ph_locs[1].setText("Y: " + self._ph_y_label.text() + " mm")
         self._inline_ph_locs[2].setText("R: " + self._ph_r_label.text() + " deg")
-        self._progress_section.setFixedHeight(96)
+        self._progress_section.setFixedHeight(130)
 
     def _hide_progress_section(self):
         self._progress_section.setFixedHeight(0)
         self._inline_progress_bar.setValue(0)
         self._inline_progress_bar.setFormat('')
         self._inline_cancel_btn.setEnabled(True)
+        for key, lbl in self._inline_mu_labels.items():
+            lbl.setText(f"{'MU1' if key=='mu1' else 'MU2' if key=='mu2' else 'Rate' if key=='mu_rate' else 'Progress'}: —")
 
     def _cancel_eudaq(self):
         self._run_active = False
@@ -1541,6 +1573,8 @@ class RunWidget(QWidget):
         self._hide_progress_section()
         if self._pid is not None:
             eudaq.stop(self._pid)
+        if hasattr(self, '_mu_tracker') and self._mu_tracker:
+            self._mu_tracker.stop()
         self._launch_eudaq_default.setEnabled(True)
         self._window.running(False)
         self.log("EUDAQ cancelled")
@@ -2405,6 +2439,11 @@ class RunWidget(QWidget):
                 self._connection["zaber"].setIcon(self._connection_icons[icon_idx])
                 self._connection["zaber"].setStyleSheet(self._connect_styles[icon_idx])
 
+        # Camera (status only — always clickable, never blocks anything)
+        cam_ok = self._window.check_camera()
+        self._connection["camera"].setIcon(self._connection_icons[1 if cam_ok else 0])
+        self._connection["camera"].setStyleSheet(self._connect_styles[1 if cam_ok else 0])
+
         # ALPIDE
         found = alpide.found_daqs()
         if found != self._window._alpide_connect:
@@ -2437,6 +2476,13 @@ class RunWidget(QWidget):
         #     out_lines[1] == "No programmed FX3 device found. Skipping FPGA programming step.":
         #         print("XXXX")
     
+    def _open_video_window(self):
+        from modules.ui.video_window import VideoWindow
+        if not hasattr(self, '_video_win') or not self._video_win.isVisible():
+            self._video_win = VideoWindow(parent=self._window)
+        self._video_win.show()
+        self._video_win.raise_()
+
     def clear_for_new(self):
         for line_edit in self._line_edits.values():
             line_edit.setText("")
@@ -2503,6 +2549,30 @@ class RunWidget(QWidget):
             pass
         # เริ่ม poll tmux ITS3 output (หลังจากที่ script เริ่มสร้าง session)
         self._terminal_widget.launch("ITS3", delay_ms=2000)
+        # สร้าง MU tracker ไว้รอ (เฉพาะ real mode) — จะ .start() ตอนกด Run
+        try:
+            import modules.sim as _sim_mod
+            _is_sim = (_sim_mod.control_room is not None
+                       or _sim_mod.main_window is not None)
+        except Exception:
+            _is_sim = False
+        # หยุด tracker เก่า (ถ้ายังค้างอยู่จาก run ก่อน) ก่อนสร้างใหม่
+        if hasattr(self, '_mu_tracker') and self._mu_tracker:
+            self._mu_tracker.stop()
+        self._mu_tracker = None
+        if not _is_sim:
+            from modules.ui.video_window import MuTracker
+            self._mu_tracker = MuTracker(
+                output_dir=self._outpath_label.text().strip(),
+                ssh_addr=self._rsync_addr_edit.text().strip(),
+                ssh_path=self._rsync_path_edit.text().strip(),
+                ssh_pass=_ssh_password or '',
+                log_fn=self.log,
+                data_fn=self._on_mu_data,
+            )
+            # pre-warm EasyOCR ทันที ไม่รอกด Run
+            self._mu_tracker.prepare()
+            # .start() (เริ่ม camera) จะถูกเรียกใน RunProgress._start_worker()
         # แสดง progress section ใน main window — ไม่ต้องเปิด dialog แยก
         self._run_active = True
         self._show_progress_section()
@@ -2518,6 +2588,10 @@ class RunWidget(QWidget):
         self._run_active = False
         self._hide_progress_section()
         self.log("Run stopped")
+        if hasattr(self, '_mu_tracker') and self._mu_tracker:
+            self._mu_tracker.stop()
+            # ไม่ set None ทันที — รอให้ TrackingWorker เสร็จแล้ว emit finished
+            # แล้ว SSHWorker จึงทำงานได้ (PyQt5 weak-ref ถ้า GC ก็ไม่ได้ signal)
         # re-enable Kill beam ถ้า ser ยังอยู่ (beam อาจยังค้างอยู่หลัง run จบ)
         if self._ser is not None:
             self._kill_beam_btn.setChecked(False)  # reset state ก่อน ป้องกัน spurious trigger
@@ -2830,7 +2904,8 @@ class RunWidget(QWidget):
         }
 
     def enable_beam(self):
-        if self._enable_checkbox.isChecked():
+        enabling = self._enable_checkbox.isChecked()
+        if enabling:
             if not (self._window._alpide_connect and self._window._zaber_connect and self._window._fpga_connect):
                 msg = QMessageBox()
                 msg.setIcon(QMessageBox.Warning)
@@ -2915,7 +2990,11 @@ class RunWidget(QWidget):
             fail_dialog.setWindowTitle("Parameter error")
             fail_dialog.setStandardButtons(QMessageBox.Ok)
             fail_dialog.exec_()
+            self._enable_checkbox.blockSignals(True)
             self._enable_checkbox.setChecked(False)
+            self._enable_checkbox.blockSignals(False)
+            if not enabling:
+                self._window.running(False)
             return
         except (ConnectionError, serial.SerialException) as e:
             fail_dialog = QMessageBox()
@@ -2928,6 +3007,12 @@ class RunWidget(QWidget):
             self._kill_beam_btn.setChecked(False)
             self._kill_beam_btn.setEnabled(False)
             self._launch_eudaq_default.setEnabled(False)
+            if enabling:
+                self._enable_checkbox.blockSignals(True)
+                self._enable_checkbox.setChecked(False)
+                self._enable_checkbox.blockSignals(False)
+            else:
+                self._window.running(False)
             return
     
     def set_ph_loc(self, loc_str):
@@ -3494,8 +3579,8 @@ class RunWidget(QWidget):
         # if kind == "num_alpides":
         msg = {
             "num_alpides": ["number of ALPIDEs", list(range(1, 7))],
-            "num_events": ["number of events", list(range(1, 100_000))],
-            "strobe": ["STROBE value", list(range(100, 801))],
+            "num_events": ["number of events", list(range(1, 10000000))],
+            "strobe": ["STROBE value", list(range(1, 801))],
             "ithr": ["I theshold", list(range(30, 121))],
             "energy": ["proton energy", list(range(70, 241))],
             "MU": ["MU", list(range(1, 100000))],

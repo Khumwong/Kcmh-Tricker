@@ -310,6 +310,12 @@ class RunProgress(QObject):
         global force_stop
         force_stop = False
         _rp_log("_start_worker called — starting ProgressWorker thread")
+        # เริ่ม MU tracker เมื่อกด Run (ไม่ใช่ตอน Launch)
+        try:
+            if getattr(self._window, '_mu_tracker', None):
+                self._window._mu_tracker.start()
+        except Exception as e:
+            _rp_log(f"MuTracker start error: {e}")
         expose_time = (float(self._window._line_edits["Exposure time (ms)"].text()) +
                        float(self._window._line_edits["Beam delay (ms)"].text())
                        ) * int(self._window._line_edits["Loops"].text()) * 1e-3

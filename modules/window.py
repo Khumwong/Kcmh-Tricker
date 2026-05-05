@@ -17,6 +17,7 @@ class MyWindow(QMainWindow):
         self._fpga_connect = False
         self._zaber_connect = False
         self._alpide_connect = False
+        self._camera_connect = False
         self.init_connect_devices()
         
         try:
@@ -156,6 +157,22 @@ class MyWindow(QMainWindow):
         else:
             self._fpga_connect = False
 
+        try:
+            import cv2, os
+            _devnull = os.open(os.devnull, os.O_WRONLY)
+            _old_stderr = os.dup(2)
+            os.dup2(_devnull, 2)
+            os.close(_devnull)
+            try:
+                _cap = cv2.VideoCapture(0)
+                self._camera_connect = _cap.isOpened()
+                _cap.release()
+            finally:
+                os.dup2(_old_stderr, 2)
+                os.close(_old_stderr)
+        except Exception:
+            self._camera_connect = False
+
     def reconnect_devices(self, device):
         if device in ["zaber", "fpga", "alpide"]:
             self._run_widget.check_connection(device)
@@ -177,6 +194,26 @@ class MyWindow(QMainWindow):
             
             self._run_widget.check_connections()
                 
+    def check_camera(self):
+        try:
+            import cv2, os
+            _devnull = os.open(os.devnull, os.O_WRONLY)
+            _old_stderr = os.dup(2)
+            os.dup2(_devnull, 2)
+            os.close(_devnull)
+            try:
+                _cap = cv2.VideoCapture(0)
+                ok = _cap.isOpened()
+                _cap.release()
+            finally:
+                os.dup2(_old_stderr, 2)
+                os.close(_old_stderr)
+            self._camera_connect = ok
+            return ok
+        except Exception:
+            self._camera_connect = False
+            return False
+
     def check_zaber(self):
         try:
             conn = zaber_connect.connect(get_port("zaber"))
@@ -234,8 +271,9 @@ class MyWindow(QMainWindow):
             rw._rsync_addr_edit.setDisabled(True)
             rw._rsync_path_edit.setDisabled(True)
             rw._rsync_connect_btn.setDisabled(True)
-            for v in rw._connection.values():
-                v.setDisabled(True)
+            for k, v in rw._connection.items():
+                if k != 'camera':
+                    v.setDisabled(True)
             for ledit in rw._line_edits.values():
                 ledit.setDisabled(True)
             # lock plan panel — cannot switch runs while beam is enabled

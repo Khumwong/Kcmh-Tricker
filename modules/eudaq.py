@@ -45,7 +45,7 @@ def gen_its3_ini(num_alpides):
             f.write(f"[Producer.ALPIDE_plane_{i}]\n")
             f.write(f"serial      = {SERIALS[i]}\n")
             f.write(f"plane       = {i}\n")
-            f.write(f"triggermode = replica #{'primary' if i == 0 else 'replica'}\n")
+            f.write(f"triggermode = {'primary' if i == 0 else 'replica'}\n")
             f.write("\n") 
 
 def gen_its3_conf(num_alpides, num_evt, strobe_length, i_threshold, outpath):
@@ -59,9 +59,9 @@ def gen_its3_conf(num_alpides, num_evt, strobe_length, i_threshold, outpath):
 
         for i in range(num_alpides):
             f.write(f"[Producer.ALPIDE_plane_{i}]\n")
-            if i == 0:
-                f.write(f"fixedbusy     = 80000\n")
-                f.write(f"minspacing    =  8000\n")
+            # if i == 0:
+            #     f.write(f"fixedbusy     = 80000\n")
+            #     f.write(f"minspacing    =  8000\n")
             f.write("EUDAQ_DC      = dc\n")
             f.write(f"EUDAQ_ID      = {i}\n")
             f.write("CHIPID        = 16\n")

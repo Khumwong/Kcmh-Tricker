@@ -106,7 +106,7 @@ if __name__ == "__main__":
         from modules.sim import apply_sim
         apply_sim()
     else:
-        subprocess.run(['tmux', 'kill-session', '-t', 'ITS3'])
+        subprocess.run(['tmux', 'kill-session', '-t', 'ITS3'], capture_output=True)
 
     app = QApplication(sys.argv)
     app.setStyleSheet(GLOBAL_STYLE)
@@ -124,7 +124,7 @@ if __name__ == "__main__":
     app.exec_()
 
     if not sim_mode:
-        subprocess.run(['tmux', 'kill-session', '-t', 'ITS3'])
+        subprocess.run(['tmux', 'kill-session', '-t', 'ITS3'], capture_output=True)
 
         baudrate = 115200
         parity = serial.PARITY_NONE
