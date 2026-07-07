@@ -7,22 +7,26 @@ from PyQt5.QtWidgets import (
 from PyQt5.QtCore import Qt
 
 PLAN_COLUMNS = [
-    "run", "label",
+    "run", "label", "mode",
     "start_x", "start_y", "start_r",
     "num_alpides", "num_events", "strobe", "ithr",
     "energy", "MU", "current",
     "Exposure time (ms)", "Beam delay (ms)", "Loops",
-    "Trigger Freq. (Hz)", "X step (mm)", "Y step (mm)", "R step (degree)"
+    "Trigger Freq. (Hz)", "X step (mm)", "Y step (mm)", "R step (degree)",
+    "qa_pos_x", "qa_pos_y", "qa_pos_r",
+    "vel_x", "vel_y", "vel_r",
 ]
 
 PLAN_DEFAULTS = {
-    "run": "", "label": "",
+    "run": "", "label": "", "mode": "treatment",
     "start_x": "0", "start_y": "0", "start_r": "0",
     "num_alpides": "6", "num_events": "30000", "strobe": "100", "ithr": "60",
     "energy": "200", "MU": "1000", "current": "10",
     "Exposure time (ms)": "1000", "Beam delay (ms)": "200", "Loops": "1",
     "Trigger Freq. (Hz)": "9500", "X step (mm)": "0",
     "Y step (mm)": "0", "R step (degree)": "0",
+    "qa_pos_x": "", "qa_pos_y": "", "qa_pos_r": "",
+    "vel_x": "0", "vel_y": "0", "vel_r": "0",
 }
 
 _BTN_STYLE = """
@@ -78,6 +82,19 @@ class CreatePlanDialog(QDialog):
         self._table.setHorizontalHeaderLabels(PLAN_COLUMNS)
         self._table.horizontalHeader().setSectionResizeMode(QHeaderView.ResizeToContents)
         self._table.horizontalHeader().setStretchLastSection(False)
+        _col_notes = {
+            "mode":            "ระบุ mode: \"treatment\" หรือ \"qa\"",
+            "X step (mm)":     "Treatment mode only — ห้ามกรอกใน QA",
+            "Y step (mm)":     "Treatment mode only — ห้ามกรอกใน QA",
+            "R step (degree)": "Treatment mode only — ห้ามกรอกใน QA",
+            "Loops":           "Treatment mode only — QA บังคับเป็น 1",
+            "vel_x":           "QA mode only — ความเร็ว X (mm/s)",
+            "vel_y":           "QA mode only — ความเร็ว Y (mm/s)",
+            "vel_r":           "QA mode only — ความเร็ว R (°/s)",
+        }
+        for col, name in enumerate(PLAN_COLUMNS):
+            if name in _col_notes:
+                self._table.horizontalHeaderItem(col).setToolTip(_col_notes[name])
         self._table.setSelectionBehavior(QAbstractItemView.SelectRows)
         self._table.setEditTriggers(QAbstractItemView.AllEditTriggers)
         self._table.setAlternatingRowColors(True)

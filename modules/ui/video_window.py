@@ -3,6 +3,7 @@ import re
 import json
 import cv2
 import subprocess
+import numpy as np
 from queue import Queue, Empty
 from datetime import datetime
 
@@ -12,7 +13,7 @@ from PyQt5.QtWidgets import (
     QMessageBox, QSizePolicy, QSpinBox, QTextEdit, QCheckBox,
     QStackedWidget,
 )
-from PyQt5.QtCore import Qt, QThread, pyqtSignal, QTimer
+from PyQt5.QtCore import Qt, QThread, pyqtSignal
 from PyQt5.QtGui import QImage, QPixmap
 
 # video/ directory sits at the project root
@@ -21,14 +22,13 @@ VIDEO_DIR = os.path.join(
     'video',
 )
 
-ROI_NAMES = ['plan_roi', 'mu1_mu2_roi', 'mu_rate_roi', 'progress_roi', 'time_roi']
+ROI_NAMES = ['mu1_roi', 'mu2_roi', 'mu_rate_roi', 'progress_roi']
 
 ROI_COLORS = {
-    'plan_roi':     (0, 200, 0),
-    'mu1_mu2_roi':  (255, 100, 0),
+    'mu1_roi':      (255, 100, 0),
+    'mu2_roi':      (255, 160, 0),
     'mu_rate_roi':  (0, 80, 255),
     'progress_roi': (220, 220, 0),
-    'time_roi':     (220, 0, 220),
 }
 
 CONFIG_PATH = os.path.join(VIDEO_DIR, 'config.json')
@@ -213,18 +213,14 @@ class TrackingWorker(QThread):
                     frame = cv2.rotate(frame, cv2.ROTATE_180)
 
                 plan1 = plan2 = mu1 = mu2 = mu_rate = progress = None
-                date_text = time_text = None
+                date_text = time_text = None  # noqa: kept for CSV schema compat
 
-                if rois.get('plan_roi'):
-                    r1, r2 = self._ocr_two(reader, frame, rois['plan_roi'])
-                    plan1 = self._validate_plan(r1)
-                    plan2 = self._validate_plan(r2)
-
-                if rois.get('mu1_mu2_roi'):
-                    r1, r2 = self._ocr_two(reader, frame, rois['mu1_mu2_roi'])
-                    mu1 = self._validate_mu(r1)
-                    mu2 = self._validate_mu(r2)
-                    mu1, mu2 = self._check_mu_pair(mu1, mu2)
+                if rois.get('mu1_roi'):
+                    r = self._ocr_one(reader, frame, rois['mu1_roi'])
+                    mu1 = self._validate_mu(r)
+                if rois.get('mu2_roi'):
+                    r = self._ocr_one(reader, frame, rois['mu2_roi'])
+                    mu2 = self._validate_mu(r)
 
                 if rois.get('mu_rate_roi'):
                     r = self._ocr_one(reader, frame, rois['mu_rate_roi'])
@@ -236,10 +232,6 @@ class TrackingWorker(QThread):
                     if loop_done:
                         self.log.emit('Loop complete (progress reset detected)')
                         self.loop_complete.emit()
-
-                if rois.get('time_roi'):
-                    r = self._ocr_one(reader, frame, rois['time_roi'])
-                    date_text, time_text = self._parse_time(r)
 
                 entry = {
                     'frame':    self._frame_count,
@@ -312,7 +304,14 @@ class TrackingWorker(QThread):
         if x2 <= x1 or y2 <= y1:
             return None
         crop = frame[y1:y2, x1:x2]
-        return crop if crop.size > 0 else None
+        if crop.size == 0:
+            return None
+        # resize ให้ height ไม่เกิน 120px — OCR เร็วขึ้นมาก ความแม่นยังดี
+        h, w = crop.shape[:2]
+        if h > 120:
+            scale = 120 / h
+            crop = cv2.resize(crop, (int(w * scale), 120), interpolation=cv2.INTER_AREA)
+        return crop
 
     def _ocr_two(self, reader, frame, coords):
         roi = self._clip_roi(frame, coords)
@@ -396,8 +395,15 @@ class TrackingWorker(QThread):
 
     def _validate_mu_rate(self, text):
         n = self._to_float(text)
-        if n and 100000 <= n <= 250000:
+        if not n:
+            return None
+        if 10000 <= n <= 300000:
             return n
+        # OCR อาจอ่าน decimal point เป็น comma/space → "52381.4" → 523814
+        if 100000 <= n <= 3000000:
+            candidate = n / 10
+            if 10000 <= candidate <= 300000:
+                return candidate
         return None
 
     def _validate_progress(self, text, plan1, plan2):
@@ -648,6 +654,14 @@ class SettingsPage(QWidget):
         self._btn_preview.clicked.connect(self._preview_rois)
         right.addWidget(self._btn_preview)
 
+        self._btn_debug_crop = QPushButton('Save Debug Crops')
+        self._btn_debug_crop.setMinimumHeight(36)
+        self._btn_debug_crop.setStyleSheet(
+            'background:#4a148c; color:#e1bee7; font-weight:bold; font-size:13px;'
+            ' border-radius:6px;')
+        self._btn_debug_crop.clicked.connect(self._save_debug_crops)
+        right.addWidget(self._btn_debug_crop)
+
         self._btn_launch = QPushButton('Ready  →')
         self._btn_launch.setMinimumHeight(42)
         self._btn_launch.setStyleSheet(
@@ -691,6 +705,25 @@ class SettingsPage(QWidget):
             src_val = int(src)
         except ValueError:
             src_val = src
+
+        # auto-scan if integer index fails
+        if isinstance(src_val, int):
+            import cv2 as _cv2
+            found = None
+            for idx in range(src_val, src_val + 5):
+                cap = _cv2.VideoCapture(idx)
+                if cap.isOpened():
+                    cap.release()
+                    found = idx
+                    break
+                cap.release()
+            if found is None:
+                QMessageBox.critical(self, 'Error', 'Cannot open camera')
+                return
+            if found != src_val:
+                self._src_edit.setText(str(found))
+            src_val = found
+
         if self._cam_thread:
             self._cam_thread.stop()
             self._cam_thread = None
@@ -827,6 +860,38 @@ class SettingsPage(QWidget):
             return
         self._show_frame()
 
+    def _save_debug_crops(self):
+        if self._current_frame is None:
+            QMessageBox.warning(self, 'Debug Crops',
+                'กด Connect ก่อน แล้วกด Freeze เพื่อหยุด frame')
+            return
+        debug_dir = os.path.join(VIDEO_DIR, 'debug')
+        os.makedirs(debug_dir, exist_ok=True)
+        saved = []
+        for name in ROI_NAMES:
+            coords = _load_roi_file(os.path.join(VIDEO_DIR, f'{name}.txt'))
+            if not coords:
+                continue
+            xs = [p[0] for p in coords]
+            ys = [p[1] for p in coords]
+            x1, x2 = max(0, min(xs)), min(self._current_frame.shape[1], max(xs))
+            y1, y2 = max(0, min(ys)), min(self._current_frame.shape[0], max(ys))
+            if x2 <= x1 or y2 <= y1:
+                continue
+            crop = self._current_frame[y1:y2, x1:x2]
+            if crop.size == 0:
+                continue
+            path = os.path.join(debug_dir, f'{name}.jpg')
+            cv2.imwrite(path, crop)
+            saved.append(name)
+        if saved:
+            QMessageBox.information(self, 'Debug Crops',
+                f'Saved {len(saved)} crops:\n' + '\n'.join(saved) +
+                f'\n\nFolder:\n{debug_dir}')
+        else:
+            QMessageBox.warning(self, 'Debug Crops',
+                'ไม่มี ROI ที่บันทึกไว้ หรือ ROI อยู่นอก frame')
+
     # ── Launch ──────────────────────────────────────────────────────────────
 
     def _on_launch(self):
@@ -872,6 +937,7 @@ class SettingsPage(QWidget):
 # ── MuTracker — used by run.py to track during a beam run ────────────────────
 
 _FRAME_INTERVAL = 3   # feed OCR every N camera frames
+_REC_CROP_W, _REC_CROP_H = 320, 80   # size per ROI strip in recorded video
 
 class MuTracker:
     """Headless camera + OCR tracker. Call start() when run begins, stop() when done."""
@@ -888,6 +954,9 @@ class MuTracker:
         self._track_worker = None
         self._ssh_worker   = None
         self._frame_count  = 0
+        self._video_writer = None
+        self._video_path   = None
+        self._rec_rois     = {}
         self._rotate       = False
         cfg = _load_config()
         src = cfg.get('camera_source', 0)
@@ -957,12 +1026,53 @@ class MuTracker:
         self._cam_thread.frame_ready.connect(self._on_frame)
         self._cam_thread.error.connect(self._log_both)
         self._cam_thread.start()
+        self._start_recording()
         self._log_both(f'camera เริ่มแล้ว → บันทึกไปที่ {self._csv_path}')
+
+    def _start_recording(self):
+        self._rec_rois = {}
+        for name in ROI_NAMES:
+            coords = _load_roi_file(os.path.join(VIDEO_DIR, f'{name}.txt'))
+            if coords:
+                self._rec_rois[name] = coords
+        if not self._rec_rois:
+            return
+        ts = datetime.now().strftime('%Y%m%d_%H%M%S')
+        vid_dir = os.path.join(self._output_dir, 'csv')
+        os.makedirs(vid_dir, exist_ok=True)
+        self._video_path = os.path.join(vid_dir, f'mu_video_{ts}.mp4')
+        fourcc = cv2.VideoWriter_fourcc(*'mp4v')
+        h = _REC_CROP_H * len(ROI_NAMES)
+        self._video_writer = cv2.VideoWriter(
+            self._video_path, fourcc, 30.0, (_REC_CROP_W, h))
+        self._log_both(f'video recording → {self._video_path}')
+
+    def _write_video_frame(self, frame):
+        if not self._video_writer or not self._video_writer.isOpened():
+            return
+        strips = []
+        for name in ROI_NAMES:
+            coords = self._rec_rois.get(name)
+            if coords:
+                xs = [p[0] for p in coords]
+                ys = [p[1] for p in coords]
+                x1 = max(0, min(xs)); x2 = min(frame.shape[1], max(xs))
+                y1 = max(0, min(ys)); y2 = min(frame.shape[0], max(ys))
+                if x2 > x1 and y2 > y1:
+                    crop = frame[y1:y2, x1:x2]
+                    strips.append(cv2.resize(crop, (_REC_CROP_W, _REC_CROP_H)))
+                    continue
+            strips.append(np.zeros((_REC_CROP_H, _REC_CROP_W, 3), dtype=np.uint8))
+        self._video_writer.write(np.vstack(strips))
 
     def stop(self):
         if self._cam_thread:
             self._cam_thread.stop()
             self._cam_thread = None
+        if self._video_writer:
+            self._video_writer.release()
+            self._video_writer = None
+            self._log_both(f'video saved → {self._video_path}')
         if self._track_worker and self._track_worker.isRunning():
             self._track_worker.stop()
 
@@ -971,6 +1081,7 @@ class MuTracker:
         if (self._track_worker and self._track_worker.isRunning()
                 and self._frame_count % _FRAME_INTERVAL == 0):
             self._track_worker.feed_frame(frame.copy())
+        self._write_video_frame(frame)
 
     def _on_finished(self, csv_path):
         self._log_both(f'MU Tracker: CSV saved → {csv_path}')
