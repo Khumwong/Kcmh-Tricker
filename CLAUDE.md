@@ -61,14 +61,15 @@ python3 run_with_stats.py <raw_file> -o <output.root>
 - `running(True/False)` disables/re-enables all UI controls during a run
 
 ### Run Widget (`modules/ui/run.py` → `RunWidget`)
-The largest module (~1800+ lines). Contains:
+The largest module (~4100+ lines). Contains:
 - Run parameter form (num ALPIDEs, events, strobe, threshold, energy, MU, loops, step sizes, etc.)
 - Phantom positioning card (delegates to `PhWidget`)
-- Connection status buttons for FPGA / Zaber / ALPIDE
+- Connection status buttons for FPGA / Zaber / ALPIDE / Camera
 - Beam enable/disable via `enable_beam()` — **see critical note below**
 - rsync configuration (SSH address + remote path + optional password)
 - After a run completes: rsync raw file to remote, then SSH-trigger ROOT conversion via `run_with_stats.py`
 - `EmbeddedTerminal`: polls `tmux capture-pane` on a 400 ms QTimer to display ITS3 session output inline
+- `_update_firmware_label()`: 2-second QTimer that polls hardware status. **Zaber and Camera checks run in background threads** (`_zaber_checking` / `_camera_checking` flags + `_on_zaber_poll_slot` / `_on_camera_poll_slot`) to avoid blocking the UI. Zaber uses `get_port("zaber")` (USB presence scan only — no serial port open) so it can poll without conflicting with phantom moves or velocity runs. FPGA still checks on main thread (deferred — see Known Deferred Issues).
 
 ### Run Progress (`modules/ui/run_progress.py` → `RunProgress`)
 - Opened when a run starts; runs acquisition loops in `QThreadPool`
@@ -100,6 +101,26 @@ Loaded and saved by `RunWidget`. Stores: output path, rsync address/path, all ru
 - `modules/ui/firmware_toast.py` (`FirmwareToast`): modal indeterminate progress dialog during ALPIDE firmware flash
 - `modules/ui/rsync_toast.py` (`RsyncToast`): non-modal progress dialog with % and speed during rsync; updated via `QMetaObject.invokeMethod` from a background thread
 
+## Automated UI Test
+
+```bash
+python3 -u test_ui.py --sim 2>/dev/null
+```
+
+`test_ui.py` (~467 lines) runs a headless PyQt5 automated test of the full UI in `--sim` mode with a real Zaber connected via Control Room. Covers: app launch, connection status, QA run flow (Launch → Start Acquisition → Stop → QA Complete dialog), velocity test dialog, speed limit warning, Treatment mode CR sequence (PREPARE / READY / BEAM ON), and footer idle state. Outputs `PASS` / `FAIL` / `SKIP` lines. Must be run with `-u` (unbuffered) so results appear immediately when redirected to a file.
+
+**Key patterns used:**
+- Schedule dialog-close timers **before** the action that triggers the dialog (Qt nested event loops mean timers fired before `exec_()` will fire inside it)
+- Use `w.accept()` to close a `QDialog` programmatically (not `QTest.keyClick` — only works if dialog has a default button)
+- 3 SKIPs are expected in Treatment mode (no real FPGA in test environment)
+
 ## Critical Hardware Rule
 
 **Never modify the DB-9 serial communication block in `modules/ui/run.py` `enable_beam()` at lines ~1789-1816 (the `serial.Serial(...)` open call and all `.write(b'\x...')` calls).** This controls the physical FPGA serial port — opening the port, sending reset bytes (`\x00 \x00`), enable byte (`\x02`), and disable byte (`\xF2`). These are the exact bytes expected by the FPGA firmware. Wrong bytes = incorrect beam control.
+
+## Known Deferred Issues
+
+### FPGA poll on main thread (low priority)
+`_update_firmware_label()` in `modules/ui/run.py` calls `fpga_connect.check_connection()` which opens `serial.Serial(port, timeout=1)` on the main thread every 2 seconds. Could block UI up to ~1 second per cycle. Not fixed yet — wait until lag is confirmed in real usage before addressing.
+
+**Fix when needed:** move to background thread using the same pattern as Zaber/camera (`_zaber_checking` / `_camera_checking` flags + `QMetaObject.invokeMethod` slot). Replace `check_connection()` with `get_port("fpga")` USB presence check to avoid opening the port.

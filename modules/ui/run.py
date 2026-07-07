@@ -7,8 +7,8 @@ from PyQt5.QtWidgets import (
     QScrollArea, QTableWidget, QTableWidgetItem, QHeaderView, QAbstractItemView,
     QTabWidget, QTextEdit
     )
-from PyQt5.QtCore import Qt, QRect, QSize, QMetaObject, Q_ARG, QTimer
-from PyQt5.QtCore import pyqtSlot, pyqtSignal
+from PyQt5.QtCore import Qt, QSize, QMetaObject, Q_ARG, QTimer
+from PyQt5.QtCore import pyqtSlot
 from PyQt5.QtGui import QIcon, QColor
 import csv
 from modules import eudaq
@@ -18,598 +18,32 @@ from modules.serial_connect import get_port
 import serial
 import modules.zaber.connect as zaber_connect
 import modules.zaber.motion as motion
+import modules.fpga.connect as fpga_connect
 import json
 import os
 from os import path
 import subprocess
 import modules.alpide as alpide
-import usb
 import time
 import threading
 import psutil
 from datetime import datetime
 
-_ssh_password = None  # cached for session lifetime only
 
-import re as _re
-
-_ANSI_FG = {
-    '30':'#4e4e4e','31':'#cc0000','32':'#4e9a06','33':'#c4a000',
-    '34':'#3465a4','35':'#75507b','36':'#06989a','37':'#d3d7cf',
-    '90':'#888a85','91':'#ef2929','92':'#8ae234','93':'#fce94f',
-    '94':'#729fcf','95':'#ad7fa8','96':'#34e2e2','97':'#eeeeec',
-}
-_ANSI_BG = {
-    '40':'#4e4e4e','41':'#cc0000','42':'#4e9a06','43':'#c4a000',
-    '44':'#3465a4','45':'#75507b','46':'#06989a','47':'#d3d7cf',
-    '100':'#888a85','101':'#ef2929','102':'#8ae234','103':'#fce94f',
-    '104':'#729fcf','105':'#ad7fa8','106':'#34e2e2','107':'#eeeeec',
-}
-# strip all CSI sequences that are NOT color/style ('m'), and OSC sequences
-_NON_COLOR_ANSI = _re.compile(
-    r'\x1b(?:\[[0-9;]*[A-HJKSTfhlnprsu]'
-    r'|\][^\x07\x1b]*(?:\x07|\x1b\\)'
-    r'|[^[\]])'
-)
-_COLOR_ANSI = _re.compile(r'\x1b\[([0-9;]*)m')
-
-def _ansi_to_html(raw: str) -> str:
-    import html as _html
-    text = _NON_COLOR_ANSI.sub('', raw)
-    parts: list = []
-    pos = 0
-    fg = bg = None
-    bold = False
-    span_open = False
-    for m in _COLOR_ANSI.finditer(text):
-        chunk = _html.escape(text[pos:m.start()])
-        if chunk:
-            parts.append(chunk)
-        pos = m.end()
-        if span_open:
-            parts.append('</span>')
-            span_open = False
-        codes = m.group(1).split(';') if m.group(1) else ['0']
-        for c in codes:
-            if c in ('0', ''):
-                fg = bg = None; bold = False
-            elif c == '1':
-                bold = True
-            elif c in _ANSI_FG:
-                fg = _ANSI_FG[c]
-            elif c in _ANSI_BG:
-                bg = _ANSI_BG[c]
-        styles: list = []
-        if fg:   styles.append(f'color:{fg}')
-        if bg:   styles.append(f'background-color:{bg}')
-        if bold: styles.append('font-weight:bold')
-        if styles:
-            parts.append(f'<span style="{";".join(styles)}">')
-            span_open = True
-    chunk = _html.escape(text[pos:])
-    if chunk:
-        parts.append(chunk)
-    if span_open:
-        parts.append('</span>')
-    body = ''.join(parts)
-    return (
-        '<html><body style="background-color:#0d1a2e;color:#c8d8e8;margin:4px;">'
-        '<pre style="font-family:Monospace,monospace;font-size:10pt;'
-        'color:#c8d8e8;margin:0;white-space:pre-wrap;word-wrap:break-word;">'
-        + body + '</pre></body></html>'
-    )
-
-
-def _format_its3_log(content: str) -> str:
-    """Convert raw ITS3 terminal snapshots into per-snapshot blocks with full producer detail."""
-    import re as _re
-
-    content = _NON_COLOR_ANSI.sub('', content)
-    content = _COLOR_ANSI.sub('', content)
-
-    _STATE_ABBR = {
-        'UNINITIALISED': 'UNINIT',
-        'UNCONFIGURED':  'UNCONF',
-        'CONFIGURED':    'CONFIG',
-        'RUNNING':       'RUN',
-        '--ERROR--':     'ERR',
-        'WAIT':          'WAIT',
-    }
-
-    def _abbr(s):
-        return _STATE_ABBR.get(s, s[:6])
-
-    _snap_re = _re.compile(r'\[(\d{2}:\d{2}:\d{2})\]\n')
-    parts = _snap_re.split(content)
-
-    snapshots = []
-    i = 1
-    while i + 1 < len(parts):
-        ts   = parts[i].strip()
-        snap = parts[i + 1]
-        i += 2
-
-        ev_m = _re.search(r'Current run:\s+(\S+)\s+events\s+\(([^)]+)\)', snap)
-        events = f"{ev_m.group(1)} ({ev_m.group(2)})" if ev_m else '-'
-
-        producers = {}
-        for m in _re.finditer(
-            r'[│|]ALPIDE_plane_(\d+)\s+(\S+)\s+(\d+)\s+(\d+)\s*(.*?)\s*[│|]', snap
-        ):
-            n = int(m.group(1))
-            producers[n] = {
-                'state':   _abbr(m.group(2)),
-                'data_ev': m.group(3),
-                'stat_ev': m.group(4),
-                'message': m.group(5).strip(),
-            }
-
-        dc_info = {'state': '-', 'data_ev': '-', 'stat_ev': '-', 'message': ''}
-        dc_m = _re.search(r'[│|]dc\s+(\S+)\s+(\d+)\s+(\d+)\s*(.*?)\s*[│|]', snap)
-        if dc_m:
-            dc_info = {
-                'state':   _abbr(dc_m.group(1)),
-                'data_ev': dc_m.group(2),
-                'stat_ev': dc_m.group(3),
-                'message': dc_m.group(4).strip(),
-            }
-
-        p_vals = {v['state'] for v in producers.values()}
-        dc_st  = dc_info['state']
-        if any('ERR' in v for v in p_vals) or dc_st == 'ERR':
-            overall = 'ERROR'
-        elif p_vals <= {'RUN'} and dc_st == 'RUN':
-            overall = 'RUNNING'
-        elif p_vals <= {'CONFIG', 'RUN'} and dc_st in ('CONFIG', 'RUN'):
-            overall = 'CONFIG'
-        elif p_vals <= {'UNINIT'} and dc_st in ('UNINIT', '-'):
-            overall = 'UNINIT'
-        elif p_vals <= {'UNCONF', 'UNINIT'}:
-            overall = 'UNCONF'
-        else:
-            overall = '/'.join(sorted(p_vals)) if p_vals else '-'
-
-        snapshots.append((ts, overall, events, producers, dc_info))
-
-    if not snapshots:
-        return content
-
-    # Build block per snapshot
-    _DETAIL_HDR = ('Plane', 'State', 'Data EV#', 'Stat EV#', 'Message')
-    lines = []
-    for ts, overall, events, producers, dc_info in snapshots:
-        lines.append(f"  {ts}  {overall}  {events}")
-
-        rows = []
-        for n in range(6):
-            p = producers.get(n, {'state': '-', 'data_ev': '-', 'stat_ev': '-', 'message': ''})
-            rows.append((f'P{n}', p['state'], p['data_ev'], p['stat_ev'], p['message']))
-        rows.append(('dc', dc_info['state'], dc_info['data_ev'], dc_info['stat_ev'], dc_info['message']))
-
-        w = [max(len(_DETAIL_HDR[c]), max(len(r[c]) for r in rows)) for c in range(5)]
-        fmt = '    ' + '  '.join(f'{{:<{w[c]}}}' for c in range(5))
-        sep = '    ' + '  '.join('-' * w[c] for c in range(5))
-        lines.append(fmt.format(*_DETAIL_HDR))
-        lines.append(sep)
-        for r in rows:
-            lines.append(fmt.format(*r).rstrip())
-        lines.append('')
-
-    lines.append(f"  Total: {len(snapshots)} snapshots")
-    return '\n'.join(lines) + '\n'
-
-
-class ZaberMoveDialog(QDialog):
-    """Modal progress dialog while Zaber stages move. Shows indeterminate bar + large emergency stop."""
-
-    STOPPED = 2
-
-    _sig_move_done  = pyqtSignal(float, float, float)
-    _sig_move_error = pyqtSignal(str)
-    _sig_stop_done  = pyqtSignal()
-
-    def __init__(self, parent, target_str):
-        super().__init__(parent)
-        self.setWindowTitle("Moving Phantom")
-        self.setModal(True)
-        self.setWindowFlags(Qt.Dialog | Qt.CustomizeWindowHint | Qt.WindowTitleHint)
-        self.result_loc   = None
-        self.result_error = None
-        self._conn      = None
-        self._conn_lock = threading.Lock()
-        self._stopping  = False
-
-        self._sig_move_done.connect(self._on_move_done)
-        self._sig_move_error.connect(self._on_move_error)
-        self._sig_stop_done.connect(self._finish_stop)
-
-        layout = QVBoxLayout(self)
-        layout.setSpacing(14)
-        layout.setContentsMargins(28, 24, 28, 24)
-
-        title = QLabel("Moving Phantom")
-        title.setAlignment(Qt.AlignCenter)
-        title.setStyleSheet("font-size: 15px; font-weight: bold; color: #1a2a3a;")
-        layout.addWidget(title)
-
-        target_lbl = QLabel(f"Target:  {target_str}")
-        target_lbl.setAlignment(Qt.AlignCenter)
-        target_lbl.setStyleSheet("font-size: 12px; color: #4a6078; font-family: monospace;")
-        layout.addWidget(target_lbl)
-
-        bar = QProgressBar()
-        bar.setRange(0, 0)
-        bar.setTextVisible(False)
-        bar.setFixedHeight(6)
-        bar.setStyleSheet("""
-            QProgressBar { background: #dde5ef; border: none; border-radius: 3px; }
-            QProgressBar::chunk { background: #1565C0; border-radius: 3px; }
-        """)
-        layout.addWidget(bar)
-
-        self._status_lbl = QLabel("Connecting to Zaber...")
-        self._status_lbl.setAlignment(Qt.AlignCenter)
-        self._status_lbl.setStyleSheet("font-size: 11px; color: #4a6078;")
-        layout.addWidget(self._status_lbl)
-
-        layout.addSpacing(10)
-
-        self._stop_btn = QPushButton("⏹   EMERGENCY STOP")
-        self._stop_btn.setFixedHeight(64)
-        self._stop_btn.setMinimumWidth(280)
-        self._stop_btn.setDefault(True)
-        self._stop_btn.setAutoDefault(True)
-        self._stop_btn.setStyleSheet("""
-            QPushButton {
-                background-color: #c62828;
-                color: white;
-                font-size: 17px;
-                font-weight: bold;
-                border-radius: 8px;
-                border: none;
-                letter-spacing: 1px;
-            }
-            QPushButton:hover   { background-color: #b71c1c; }
-            QPushButton:pressed { background-color: #7f0000; }
-            QPushButton:disabled { background-color: #888; color: #ccc; }
-        """)
-        self._stop_btn.clicked.connect(self._emergency_stop)
-        layout.addWidget(self._stop_btn)
-
-        hint = QLabel("Press  Enter  or click to stop")
-        hint.setAlignment(Qt.AlignCenter)
-        hint.setStyleSheet("font-size: 10px; color: #8090a0;")
-        layout.addWidget(hint)
-
-        self.setMinimumWidth(340)
-        self._stop_btn.setFocus()
-
-    def set_conn(self, conn):
-        with self._conn_lock:
-            self._conn = conn
-        QMetaObject.invokeMethod(
-            self._status_lbl, "setText", Qt.QueuedConnection, Q_ARG(str, "Moving...")
-        )
-
-    def _emergency_stop(self):
-        self._stopping = True
-        self._stop_btn.setEnabled(False)
-        self._stop_btn.setText("Stopping...")
-        with self._conn_lock:
-            conn = self._conn
-        if conn is None:
-            self._sig_stop_done.emit()
-            return
-        def _do_stop():
-            try:
-                motion.stop_all(conn)
-            except Exception:
-                pass
-            self._sig_stop_done.emit()
-        threading.Thread(target=_do_stop, daemon=True).start()
-
-    @pyqtSlot()
-    def _finish_stop(self):
-        self.done(self.STOPPED)
-
-    @pyqtSlot(float, float, float)
-    def _on_move_done(self, x, y, r):
-        if self._stopping:
-            self.done(self.STOPPED)
-        else:
-            self.result_loc = (x, y, r)
-            self.accept()
-
-    @pyqtSlot(str)
-    def _on_move_error(self, err):
-        if self._stopping:
-            # error is expected when stop_all interrupts apply_move — treat as STOPPED
-            self.done(self.STOPPED)
-        else:
-            self.result_error = err
-            self.reject()
-
-
-class EmbeddedTerminal(QWidget):
-    """Multi-pane tmux terminal: ANSI color, 1000-line scrollback, send-keys, per-pane tabs."""
-
-    POLL_MS    = 400
-    SCROLLBACK = 1000
-
-    _STATE_RE = _re.compile(r'ALPIDE_plane_\d+\s+(\S+)')
-
-    _PLACEHOLDER_STYLE = (
-        "QTextEdit { background-color:#0d1a2e; color:#3a5878; border:none; padding:4px; }"
-    )
-
-    def __init__(self, parent=None):
-        super().__init__(parent)
-        self._session      = None
-        self._pane_widgets: dict = {}
-        self._pane_timers:  dict = {}
-        self._last_texts:   dict = {}
-        self._last_states        = None
-        self._last_log_time      = None
-        self._log_file           = None
-        self.log_path            = None
-        self._has_placeholder    = False
-
-        layout = QVBoxLayout(self)
-        layout.setContentsMargins(0, 0, 0, 0)
-        layout.setSpacing(2)
-
-        self._pane_tabs = QTabWidget()
-        self._pane_tabs.setStyleSheet("""
-            QTabWidget::pane { background:#0d1a2e; border:none; }
-            QTabBar::tab {
-                background:#1a2e44; color:#8aaac8;
-                border:1px solid #2a3f58; border-bottom:none;
-                padding:2px 10px; font-size:9pt; font-family:monospace;
-            }
-            QTabBar::tab:selected { background:#0d1a2e; color:#c8d8e8; }
-            QTabBar::tab:hover:!selected { background:#243650; }
-        """)
-        layout.addWidget(self._pane_tabs, 1)
-        self._show_placeholder()
-
-        input_row = QHBoxLayout()
-        input_row.setContentsMargins(0, 2, 0, 0)
-        input_row.setSpacing(4)
-        self._input_line = QLineEdit()
-        self._input_line.setPlaceholderText("send-keys → active pane  (Enter to send)")
-        self._input_line.setStyleSheet("""
-            QLineEdit {
-                background:#0d1a2e; color:#c8d8e8;
-                border:1px solid #2a3f58; border-radius:3px;
-                font-family:monospace; font-size:10pt; padding:2px 6px;
-            }
-        """)
-        self._send_btn = QPushButton("Send")
-        self._send_btn.setFixedWidth(52)
-        self._send_btn.setStyleSheet("""
-            QPushButton {
-                background:#1a3a5c; color:#c8d8e8; border:1px solid #2a3f58;
-                border-radius:3px; font-size:10pt; padding:2px 6px;
-            }
-            QPushButton:hover { background:#24507c; }
-            QPushButton:pressed { background:#0d2a44; }
-        """)
-        self._send_btn.clicked.connect(self._send_keys)
-        self._input_line.returnPressed.connect(self._send_keys)
-        input_row.addWidget(self._input_line)
-        input_row.addWidget(self._send_btn)
-        layout.addLayout(input_row)
-
-        self._discover_timer = QTimer(self)
-        self._discover_timer.setInterval(2000)
-        self._discover_timer.timeout.connect(self._discover_panes)
-
-    def launch(self, session_name: str = "ITS3", delay_ms: int = 1500):
-        self._session = session_name
-        self._clear_all_panes()
-        import tempfile as _tf, os as _os
-        fd, self.log_path = _tf.mkstemp(prefix="its3_run_", suffix=".log")
-        _os.close(fd)
-        self._log_file = open(self.log_path, 'w', encoding='utf-8')
-        QTimer.singleShot(delay_ms, self._start_poll)
-
-    def _start_poll(self):
-        self._discover_panes()
-        self._discover_timer.start()
-
-    def _discover_panes(self):
-        if not self._session:
-            return
-        result = subprocess.run(
-            ['tmux', 'list-panes', '-t', self._session,
-             '-F', '#{pane_index} #{pane_current_command}'],
-            capture_output=True, text=True
-        )
-        if result.returncode != 0:
-            return
-        current: dict = {}
-        for line in result.stdout.strip().splitlines():
-            parts = line.split(' ', 1)
-            idx = parts[0]
-            cmd = (parts[1] if len(parts) > 1 else '').strip() or f"pane {idx}"
-            current[idx] = cmd
-        for idx, cmd in current.items():
-            if idx not in self._pane_widgets:
-                self._add_pane(idx, cmd)
-        for idx in list(self._pane_widgets):
-            if idx not in current:
-                self._remove_pane(idx)
-
-    def _show_placeholder(self):
-        if self._has_placeholder:
-            return
-        ph = QTextEdit()
-        ph.setReadOnly(True)
-        ph.setStyleSheet(self._PLACEHOLDER_STYLE)
-        self._pane_tabs.addTab(ph, "ITS3")
-        self._has_placeholder = True
-
-    def _hide_placeholder(self):
-        if not self._has_placeholder:
-            return
-        self._pane_tabs.removeTab(0)
-        self._has_placeholder = False
-
-    def _make_display(self) -> QTextEdit:
-        w = QTextEdit()
-        w.setReadOnly(True)
-        w.setStyleSheet(
-            "QTextEdit { background-color:#0d1a2e; color:#c8d8e8; border:none; padding:4px; }"
-        )
-        return w
-
-    def _add_pane(self, pane_idx: str, title: str):
-        self._hide_placeholder()
-        display = self._make_display()
-        self._pane_widgets[pane_idx] = display
-        self._last_texts[pane_idx]   = ""
-        timer = QTimer(self)
-        timer.setInterval(self.POLL_MS)
-        timer.timeout.connect(lambda idx=pane_idx: self._refresh_pane(idx))
-        timer.start()
-        self._pane_timers[pane_idx] = timer
-        self._pane_tabs.addTab(display, f"[{pane_idx}] {title}")
-
-    def _remove_pane(self, pane_idx: str):
-        if pane_idx in self._pane_timers:
-            self._pane_timers.pop(pane_idx).stop()
-        if pane_idx in self._pane_widgets:
-            w = self._pane_widgets.pop(pane_idx)
-            i = self._pane_tabs.indexOf(w)
-            if i >= 0:
-                self._pane_tabs.removeTab(i)
-        self._last_texts.pop(pane_idx, None)
-
-    def _clear_all_panes(self):
-        self._discover_timer.stop()
-        for t in self._pane_timers.values():
-            t.stop()
-        self._pane_timers.clear()
-        self._pane_widgets.clear()
-        self._last_texts.clear()
-        self._has_placeholder = False
-        while self._pane_tabs.count():
-            self._pane_tabs.removeTab(0)
-        self._show_placeholder()
-
-    def _refresh_pane(self, pane_idx: str):
-        target = f"{self._session}:{pane_idx}"
-        result = subprocess.run(
-            ['tmux', 'capture-pane', '-p', '-e', '-S', f'-{self.SCROLLBACK}', '-t', target],
-            capture_output=True, text=True
-        )
-        if result.returncode != 0:
-            return
-        text = result.stdout
-        if text == self._last_texts.get(pane_idx):
-            return
-        self._last_texts[pane_idx] = text
-        if pane_idx == '0':
-            from datetime import datetime as _dt
-            states = tuple(self._STATE_RE.findall(text))
-            now = _dt.now()
-            state_changed = states != self._last_states
-            time_elapsed = (
-                self._last_log_time is None or
-                (now - self._last_log_time).total_seconds() >= 5
-            )
-            if (state_changed or time_elapsed) and self._log_file and not self._log_file.closed:
-                self._last_states = states
-                self._last_log_time = now
-                self._log_file.write(f"[{now.strftime('%H:%M:%S')}]\n{text}\n")
-                self._log_file.flush()
-        widget = self._pane_widgets.get(pane_idx)
-        if not widget:
-            return
-        sb = widget.verticalScrollBar()
-        at_bottom = sb.value() >= sb.maximum() - 4
-        widget.setHtml(_ansi_to_html(text))
-        if at_bottom:
-            sb.setValue(sb.maximum())
-
-    def _send_keys(self):
-        text = self._input_line.text()
-        if not text or not self._session:
-            return
-        pane_idx = self._active_pane_idx()
-        subprocess.run(
-            ['tmux', 'send-keys', '-t', f"{self._session}:{pane_idx}", text, 'Enter']
-        )
-        self._input_line.clear()
-
-    def _active_pane_idx(self) -> str:
-        widget = self._pane_tabs.currentWidget()
-        for idx, w in self._pane_widgets.items():
-            if w is widget:
-                return idx
-        return '0'
-
-    def force_snapshot(self):
-        """Force-write a log snapshot for pane 0 immediately (e.g. at end of each loop)."""
-        if not self._session or not self._log_file or self._log_file.closed:
-            return
-        target = f"{self._session}:0"
-        result = subprocess.run(
-            ['tmux', 'capture-pane', '-p', '-e', '-S', f'-{self.SCROLLBACK}', '-t', target],
-            capture_output=True, text=True
-        )
-        if result.returncode != 0:
-            return
-        text = result.stdout
-        from datetime import datetime as _dt
-        now = _dt.now()
-        self._last_states = tuple(self._STATE_RE.findall(text))
-        self._last_log_time = now
-        self._log_file.write(f"[{now.strftime('%H:%M:%S')}]\n{text}\n")
-        self._log_file.flush()
-
-    def terminate(self):
-        self._clear_all_panes()
-        if self._log_file and not self._log_file.closed:
-            self._log_file.close()
-        self._session = None
-        self._last_states = None
-
-
-class AppLogWidget(QWidget):
-    """Activity log — แสดง action ที่ user/โปรแกรมทำ พร้อม timestamp."""
-
-    _LOG_STYLE = """
-        QPlainTextEdit {
-            background-color: #0d1a2e;
-            color: #c8d8e8;
-            font-family: 'Monospace', monospace;
-            font-size: 10pt;
-            border: none;
-            padding: 4px;
-            selection-background-color: #1e5080;
-        }
-    """
-
-    def __init__(self, parent=None):
-        super().__init__(parent)
-        layout = QVBoxLayout(self)
-        layout.setContentsMargins(0, 0, 0, 0)
-        layout.setSpacing(0)
-        self._display = QPlainTextEdit()
-        self._display.setReadOnly(True)
-        self._display.setStyleSheet(self._LOG_STYLE)
-        layout.addWidget(self._display)
-
-    def append(self, message: str):
-        ts = datetime.now().strftime("%H:%M:%S")
-        line = f"[{ts}]  {message}"
-        self._display.appendPlainText(line)
-        sb = self._display.verticalScrollBar()
-        sb.setValue(sb.maximum())
-
-    def clear(self):
-        self._display.setPlainText("")
+import modules.sound as _sound
+
+_SOUND_DIR = os.path.join(os.path.dirname(os.path.dirname(os.path.dirname(__file__))), "sound")
+
+from modules.ui.terminal import _format_its3_log
+from modules.ui.zaber_dialog import ZaberMoveDialog
+from modules.ui.terminal import EmbeddedTerminal, AppLogWidget
+from modules.ui.qa_dialog import _QACompleteDialog
+from modules.run_config import RunConfig
+from modules.ui.notification_panel import NotificationPanel
+from modules.rsync_manager import RsyncManager
+from modules.ui.plan_manager import PlanManager
+from modules.ui.phantom_panel import PhantomPanel
+from modules.beam_controller import BeamController, RESET_BYTE, ENABLE_BYTE, DISABLE_BYTE
 
 
 class RunWidget(QWidget):
@@ -620,17 +54,18 @@ class RunWidget(QWidget):
         self._run_type = 0
         self._pid = None
         self._run_active = False
-        self._phantom_moving = False
+        self._phantom_panel = PhantomPanel(parent=self)
+        self._phantom_panel.stopped.connect(self._on_phantom_stopped_slot)
         self._active_move_dlg = None
         self._w = None
         self._opened_file = None
         self._first_file = None
         self._run_stats_start = None
+        self._qa_launch_time = None
+        self._zaber_max_speeds = None
         self._checks = [0, 0]
-        self._auto_kill_timer = QTimer(self)
-        self._auto_kill_timer.setInterval(1000)
-        self._auto_kill_timer.timeout.connect(self._tick_auto_kill)
-        self._auto_kill_countdown = 0
+        self._beam_ctrl = BeamController(parent=self)
+        self._beam_ctrl._auto_kill_timer.timeout.connect(self._tick_auto_kill)
         self._blink_timer = QTimer(self)
         self._blink_timer.setInterval(500)
         self._blink_timer.timeout.connect(self._tick_blink)
@@ -665,6 +100,15 @@ class RunWidget(QWidget):
             }
         """,
         ]
+        self._pill_active_style = """
+            QPushButton { background: #ffffff; color: #1e3a5f; font-size: 12px; font-weight: bold;
+                          border: none; border-radius: 6px; padding: 4px 14px; }
+        """
+        self._pill_inactive_style = """
+            QPushButton { background: transparent; color: rgba(255,255,255,0.6); font-size: 12px; font-weight: bold;
+                          border: none; border-radius: 6px; padding: 4px 14px; }
+            QPushButton:hover { color: rgba(255,255,255,0.9); background: rgba(255,255,255,0.08); }
+        """
         self._firmware_label = QLabel("● Firmware Installed")
         self._firmware_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
         self._rsync_header_label = QLabel("rsync: —")
@@ -688,40 +132,15 @@ class RunWidget(QWidget):
             v.setIconSize(QSize(20, 20))
             v.setFixedWidth(150)
         self.check_connections()
-    # for conn_name, is_conn in zip(["ALPIDE", "Zaber", "FPGA"], 
-        #                      [self._window._alpide_connect, self._window._zaber_connect,
-        #                       self._window._fpga_connect]):
-        #     conn_layout = QHBoxLayout()
-        #     conn_layout.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        #     conn_layout.addWidget(self._connection_icons[1] if is_conn else self._connection_icons[0])
-        #     conn_label = QLabel(conn_name)
-        #     conn_label.setStyleSheet("""
-        #     QLabel{
-        #         font-size: 24px;
-        #     }
-        #                              """)
-        #     conn_icon_label = QLabel()
-        #     conn_icon_label.setIcon
-        #     conn_layout.addWidget()
 
-        # Plan state
-        self._plan_data = []
-        self._plan_status = []
-        self._plan_current = -1
-        self._plan_path = None
+        # Plan state — data model delegated to PlanManager
+        self._plan_mgr = PlanManager(parent=self)
+        self._plan_mgr.plan_changed.connect(self._on_plan_changed_slot)
 
-        self._config_path = path.join(os.getcwd(), 'config.json')
-        default_outpath = path.join(os.getcwd(), 'output')
-        default_rsync_address = ''
-        default_rsync_path = ''
-        try:
-            with open(self._config_path, 'r') as f:
-                _cfg = json.load(f)
-                default_outpath = _cfg.get('outpath', default_outpath)
-                default_rsync_address = _cfg.get('rsync_address', '')
-                default_rsync_path = _cfg.get('rsync_path', '')
-        except (FileNotFoundError, json.JSONDecodeError):
-            pass
+        self._config = RunConfig(path.join(os.getcwd(), 'config.json'))
+        default_outpath = self._config.get('outpath', path.join(os.getcwd(), 'output'))
+        default_rsync_address = self._config.get('rsync_address', '')
+        default_rsync_path = self._config.get('rsync_path', '')
         self._outpath_label = QLabel(default_outpath)
         self._outpath_btn = QPushButton("output")
         self._outpath_btn.clicked.connect(self.chooseOutpath)
@@ -735,6 +154,12 @@ class RunWidget(QWidget):
         self._rsync_status_label.setStyleSheet("QLabel{ font-size: 12px; color: #8898a8; font-family: monospace; }")
         self._rsync_toast = None
         self._rsync_connected = False
+        self._rsync_mgr = RsyncManager(parent=self)
+        self._rsync_mgr.status_changed.connect(self._on_rsync_status_slot)
+        self._rsync_mgr.done.connect(self._on_rsync_done_slot)
+        self._rsync_mgr.failed.connect(self._on_rsync_failed_slot)
+        self._rsync_mgr.progress.connect(self._rsync_progress_slot)
+        self._rsync_mgr.proc_created.connect(self._on_rsync_proc_created_slot)
         self._current_file = None
         self._launch_eudaq_default = QPushButton("Launch default")
         self._launch_eudaq_default.setEnabled(False)
@@ -749,17 +174,6 @@ class RunWidget(QWidget):
             QCheckBox::indicator { width: 16px; height: 16px; }
         """)
         self._gate_checkbox = QCheckBox()
-        # self._gate_checkbox.setText("Open Gate")
-        # self._gate_checkbox.setStyleSheet("""
-        # QCheckBox{
-        #     font-size: 24px;
-        # }
-        # QCheckBox::indicator{
-        #     width: 40px;
-        #     height: 40px;
-        # }
-        #                                   """)
-        # self._gate_checkbox.stateChanged.connect(lambda x: self.beam_action(1))
         self._enable_checkbox = QCheckBox()
         self._enable_checkbox.setText("Enable")
         self._enable_checkbox.setStyleSheet("""
@@ -789,10 +203,8 @@ class RunWidget(QWidget):
             lambda s: self.log(f"Auto kill beam {'ON' if s else 'OFF'}")
         )
         self._launch_eudaq_default.clicked.connect(self.launch_eudaq)
-        # self._kill_beam_btn.clicked.connect(lambda kind: self.launch_eudaq("auto"))
         self._kill_beam_btn.setFixedHeight(40)
         self._launch_eudaq_default.setFixedHeight(40)
-        # self._launch_eudaq_default.setDisabled(True)
         self._launch_eudaq_default.setStyleSheet("""
             QPushButton {
                 font-size: 14px;
@@ -871,18 +283,18 @@ class RunWidget(QWidget):
             "Beam delay (ms)": "The delay beam hit event between phantom translations: 0 - 255",
             "Loops": "The loop of radiation: must be less than exposure time",
             "Trigger Freq. (Hz)": "The trigger frequency: 1 - 95000",
-            "X step (mm)": "", "Y step (mm)": "", "R step (degree)": "",
+            "X step (mm)": "Stage X step per loop (mm) — max 150 mm",
+            "Y step (mm)": "Stage Y step per loop (mm) — max 40 mm",
+            "R step (degree)": "Stage R step per loop (°) — max 360°",
         }
         # โหลดค่าล่าสุดจาก config ถ้ามี
-        try:
-            with open(self._config_path, 'r') as f:
-                _saved_fields = json.load(f).get('fields', {})
-        except (FileNotFoundError, json.JSONDecodeError):
-            _saved_fields = {}
+        _saved_fields = self._config.get('fields', {})
+        _saved_qa = self._config.get('qa_pos', {})
         for k, v in self._line_edits.items():
             v.setText(_saved_fields.get(k, _field_defaults.get(k, "")))
             if _field_tooltips.get(k):
                 v.setToolTip(_field_tooltips[k])
+        self._saved_qa_config = _saved_qa  # apply after grid fields are created
         for k, v in self._line_edits.items():
             v.editingFinished.connect(lambda x=k: self.validate_fields(x))
             v.editingFinished.connect(self._save_fields)
@@ -910,67 +322,26 @@ class RunWidget(QWidget):
                     border-color: #c8d4e0;
                 }
             """)
-        # self._line_edits["num_alpides"].setToolTip("Number of alpide (1 - 6)")
-        # self._line_edits["num_events"].setToolTip("")
-        # self._line_edits["strobe"].setToolTip("")
-        # self._line_edits["ithr"].setToolTip("")
-        # self._line_edits["energy"].setToolTip("")
-        # self._line_edits["MU"].setToolTip("")
-        # self._line_edits["current"].setToolTip("")
-        # self._line_edits["Exposure time (ms)"].setToolTip("")
-        # self._line_edits["Beam delay (ms)"].setToolTip("")
-        # self._line_edits["Loops"].setToolTip("")
-        # self._line_edits["Trigger Freq. (Hz)"].setToolTip("")
-        # self._line_edits["X step (mm)"].setToolTip("")
-        # self._line_edits["Y step (mm)"].setToolTip("")
-        # self._line_edits["R step (degree)"].setToolTip("")
         self._top_widget = QFrame()
         self._bottom_widget = QFrame()
 
         # ── Notification history ─────────────────────────────────────────
-        self._notifications = []   # list of dicts {time, title, message, icon_color}
-        self._unread_count = 0
-        self._notif_panel = None   # created lazily
-
-        # Bell button
-        self._bell_btn = QPushButton("🔔")
-        self._bell_btn.setFixedSize(36, 36)
-        self._bell_btn.setCursor(Qt.CursorShape.PointingHandCursor)
-        self._bell_btn.setToolTip("Notification history")
-        self._bell_btn.setStyleSheet("""
-            QPushButton {
-                font-size: 17px;
-                background-color: rgba(255,255,255,0.08);
-                border: 1px solid rgba(255,255,255,0.18);
-                border-radius: 7px;
-                color: #ffffff;
-            }
-            QPushButton:hover { background-color: rgba(255,255,255,0.18); }
-            QPushButton:pressed { background-color: rgba(255,255,255,0.06); }
-        """)
-        self._bell_btn.clicked.connect(self._toggle_notification_panel)
-
-        # Badge label (positioned as sibling inside a container QFrame)
-        self._bell_badge = QLabel("")
-        self._bell_badge.setAlignment(Qt.AlignCenter)
-        self._bell_badge.setFixedSize(16, 16)
-        self._bell_badge.setVisible(False)
-        self._bell_badge.setStyleSheet("""
-            QLabel {
-                background-color: #ff4757;
-                color: #ffffff;
-                font-size: 9px;
-                font-weight: bold;
-                border-radius: 8px;
-                border: 1px solid #1e3a5f;
-            }
-        """)
+        self._notif = NotificationPanel(parent_widget=self)
         self.init_ui()
+        # velocity fields ใช้เฉพาะ QA mode — disabled ตั้งแต่แรก (default = Treatment)
+        for edit in [self._vel_x_edit, self._vel_y_edit, self._vel_r_edit]:
+            edit.setEnabled(False)
+        if self._window._sim_mode:
+            self.set_zaber_max_speeds((2.54, 2.44, 6.0))
         # poll device status ทุก 2 วินาที
         self._firmware_timer = QTimer(self)
         self._firmware_timer.setInterval(2000)
         self._firmware_timer.timeout.connect(self._update_firmware_label)
         self._firmware_timer.start()
+        self._pos_poll_timer = QTimer(self)
+        self._pos_poll_timer.setInterval(400)
+        self._pos_poll_timer.timeout.connect(self._poll_position)
+        self._set_qa_mode(False)
 
     def init_ui(self):
 
@@ -1055,9 +426,33 @@ class RunWidget(QWidget):
         header_layout = QHBoxLayout()
         header_layout.setContentsMargins(16, 10, 16, 10)
         header_layout.setSpacing(12)
+
+        # Treatment / QA pill — อันแรกก่อน ALPIDE
+        self._mode_treatment_btn = QPushButton("Treatment")
+        self._mode_qa_btn = QPushButton("QA")
+        self._mode_treatment_btn.setStyleSheet(self._pill_active_style)
+        self._mode_qa_btn.setStyleSheet(self._pill_inactive_style)
+        self._mode_treatment_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        self._mode_qa_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        self._mode_treatment_btn.clicked.connect(lambda: self._set_qa_mode(False))
+        self._mode_qa_btn.clicked.connect(lambda: self._set_qa_mode(True))
+        _mode_pill = QFrame()
+        _mode_pill.setFixedHeight(38)
+        _mode_pill.setStyleSheet("""
+            QFrame { background: rgba(255,255,255,0.12); border-radius: 8px;
+                     border: 1px solid rgba(255,255,255,0.22); }
+        """)
+        _pill_layout = QHBoxLayout(_mode_pill)
+        _pill_layout.setContentsMargins(3, 3, 3, 3)
+        _pill_layout.setSpacing(2)
+        _pill_layout.addWidget(self._mode_treatment_btn)
+        _pill_layout.addWidget(self._mode_qa_btn)
+        header_layout.addWidget(_mode_pill)
+
         for btn in self._connection.values():
             btn.setFixedHeight(36)
             header_layout.addWidget(btn)
+
         header_layout.addStretch(1)
 
         # bordered status box — firmware | rsync
@@ -1088,11 +483,11 @@ class RunWidget(QWidget):
         bell_wrap = QFrame()
         bell_wrap.setFixedSize(44, 38)
         bell_wrap.setStyleSheet("QFrame { background: transparent; border: none; }")
-        self._bell_btn.setParent(bell_wrap)
-        self._bell_btn.setGeometry(0, 1, 36, 36)
-        self._bell_badge.setParent(bell_wrap)
-        self._bell_badge.setGeometry(24, 0, 16, 16)
-        self._bell_badge.raise_()
+        self._notif._bell_btn.setParent(bell_wrap)
+        self._notif._bell_btn.setGeometry(0, 1, 36, 36)
+        self._notif._bell_badge.setParent(bell_wrap)
+        self._notif._bell_badge.setGeometry(24, 0, 16, 16)
+        self._notif._bell_badge.raise_()
         header_layout.addWidget(bell_wrap)
 
         self._top_widget.setStyleSheet("""
@@ -1128,7 +523,7 @@ class RunWidget(QWidget):
         ph_card_layout = QVBoxLayout(self._phantom_card)
         ph_card_layout.setContentsMargins(0, 0, 0, 8)
         ph_card_layout.setSpacing(0)
-        ph_card_layout.addWidget(make_section_header("Phantom Control"))
+        ph_card_layout.addWidget(make_section_header("Zaber"))
 
         ph_inner = QWidget()
         ph_inner_layout = QVBoxLayout(ph_inner)
@@ -1154,13 +549,16 @@ class RunWidget(QWidget):
         self._ph_x_edit_ctrl = QLineEdit(self._window.orig_loc[0])
         self._ph_y_edit_ctrl = QLineEdit(self._window.orig_loc[1])
         self._ph_r_edit_ctrl = QLineEdit(self._window.orig_loc[2])
+        self._ph_x_edit_ctrl.setToolTip("Go to X position (mm) — max 150 mm")
+        self._ph_y_edit_ctrl.setToolTip("Go to Y position (mm) — max 40 mm")
+        self._ph_r_edit_ctrl.setToolTip("Go to R position (°) — max 360°")
         self._ph_x_edit_ctrl.textChanged.connect(lambda: self._ph_change_line_edit(0))
         self._ph_y_edit_ctrl.textChanged.connect(lambda: self._ph_change_line_edit(1))
         self._ph_r_edit_ctrl.textChanged.connect(lambda: self._ph_change_line_edit(2))
 
-        _axis_lbl_style = "QLabel { font-size: 12px; font-weight: bold; color: #1e2d3d; border: none; min-width: 14px; }"
-        _unit_lbl_style = "QLabel { font-size: 11px; color: #4a6078; border: none; }"
-        _section_lbl_style = "QLabel { font-size: 11px; font-weight: bold; color: #4a6078; border: none; text-transform: uppercase; letter-spacing: 1px; }"
+        _axis_lbl_style = "QLabel { font-size: 12px; font-weight: bold; color: #1e2d3d; border: none; background: transparent; min-width: 14px; }"
+        _unit_lbl_style = "QLabel { font-size: 11px; color: #4a6078; border: none; background: transparent; }"
+        _section_lbl_style = "QLabel { font-size: 11px; font-weight: bold; color: #4a6078; border: none; background: transparent; text-transform: uppercase; letter-spacing: 1px; }"
         _disp_style = ("QLabel { font-size: 13px; font-weight: bold; font-family: monospace;"
                        " color: #1565C0; background: #f4f7fb; border: 1px solid #dde5ef;"
                        " border-radius: 5px; padding: 3px 8px; min-width: 64px; }")
@@ -1249,6 +647,97 @@ class RunWidget(QWidget):
         ph_body.addLayout(ph_grid)
 
         ph_inner_layout.addLayout(ph_body)
+
+        # ── Step + Velocity grid ──────────────────────────────────────────
+        def _make_hdiv():
+            d = QFrame(); d.setFixedHeight(1)
+            d.setStyleSheet("QFrame { background: #dde5ef; border: none; }")
+            return d
+
+        ph_inner_layout.addSpacing(6)
+        ph_inner_layout.addWidget(_make_hdiv())
+        ph_inner_layout.addSpacing(4)
+
+        sv_grid = QGridLayout()
+        sv_grid.setSpacing(4)
+        sv_grid.setColumnStretch(1, 1)
+        sv_grid.setColumnStretch(5, 1)
+        sv_grid.setColumnStretch(7, 1)
+
+        step_hdr = QLabel("Step  (per loop)"); step_hdr.setStyleSheet(_section_lbl_style)
+        tgt_hdr  = QLabel("Target"); tgt_hdr.setStyleSheet(_section_lbl_style)
+        spd_hdr  = QLabel("Speed"); spd_hdr.setStyleSheet(_section_lbl_style)
+        sv_grid.addWidget(step_hdr, 0, 0, 1, 3)
+        sv_grid.addWidget(tgt_hdr,  0, 5)
+        sv_grid.addWidget(spd_hdr,  0, 7)
+
+        sv_vsep = QFrame(); sv_vsep.setFrameShape(QFrame.VLine)
+        sv_vsep.setStyleSheet("QFrame { background: #dde5ef; border: none; }")
+        sv_grid.addWidget(sv_vsep, 0, 3, 4, 1)
+        self._qa_col_widgets = []
+
+        self._qa_pos_x_edit = QLineEdit("")
+        self._qa_pos_y_edit = QLineEdit("")
+        self._qa_pos_r_edit = QLineEdit("")
+        self._qa_pos_x_edit.setToolTip("Target X position (mm) — max 150 mm")
+        self._qa_pos_y_edit.setToolTip("Target Y position (mm) — max 40 mm")
+        self._qa_pos_r_edit.setToolTip("Target R position (°) — max 360°")
+        self._vel_x_edit = QLineEdit("0")
+        self._vel_y_edit = QLineEdit("0")
+        self._vel_r_edit = QLineEdit("0")
+        self._vel_x_edit.setToolTip("Speed X (mm/s) — max 2.5 mm/s\n0 = axis does not move")
+        self._vel_y_edit.setToolTip("Speed Y (mm/s) — max 2.5 mm/s\n0 = axis does not move")
+        self._vel_r_edit.setToolTip("Speed R (°/s) — max 6.0 °/s\n0 = axis does not move")
+
+        sv_axes = [
+            ("X", self._line_edits["X step (mm)"],     "mm",
+             self._qa_pos_x_edit, "mm", self._vel_x_edit, "mm/s"),
+            ("Y", self._line_edits["Y step (mm)"],     "mm",
+             self._qa_pos_y_edit, "mm", self._vel_y_edit, "mm/s"),
+            ("R", self._line_edits["R step (degree)"], "°",
+             self._qa_pos_r_edit, "°",  self._vel_r_edit, "°/s"),
+        ]
+        for i, (axis, s_edit, s_unit, p_edit, p_unit, v_edit, v_unit) in enumerate(sv_axes):
+            row = i + 1
+            a_s = QLabel(axis); a_s.setStyleSheet(_axis_lbl_style); a_s.setFixedWidth(14)
+            u_s = QLabel(s_unit); u_s.setStyleSheet(_unit_lbl_style)
+            s_edit.setFixedHeight(28); s_edit.setMinimumWidth(40)
+            s_edit.setAlignment(Qt.AlignmentFlag.AlignCenter); s_edit.setStyleSheet(_edit_style)
+            sv_grid.addWidget(a_s,    row, 0)
+            sv_grid.addWidget(s_edit, row, 1)
+            sv_grid.addWidget(u_s,    row, 2)
+            a_q = QLabel(axis); a_q.setStyleSheet(_axis_lbl_style); a_q.setFixedWidth(14)
+            u_p = QLabel(p_unit); u_p.setStyleSheet(_unit_lbl_style)
+            u_v = QLabel(v_unit); u_v.setStyleSheet(_unit_lbl_style)
+            for edit in (p_edit, v_edit):
+                edit.setFixedHeight(28)
+                edit.setAlignment(Qt.AlignmentFlag.AlignCenter)
+                edit.setStyleSheet(_edit_style)
+            sv_grid.addWidget(a_q,    row, 4)
+            sv_grid.addWidget(p_edit, row, 5)
+            sv_grid.addWidget(u_p,    row, 6)
+            sv_grid.addWidget(v_edit, row, 7)
+            sv_grid.addWidget(u_v,    row, 8)
+            pass
+
+        ph_inner_layout.addLayout(sv_grid)
+
+        self._vel_limit_label = QLabel("max speed: — mm/s  — mm/s  — °/s")
+        self._vel_limit_label.setStyleSheet(
+            "QLabel { font-size: 10px; color: #4a6078; border: none; }")
+        ph_inner_layout.addWidget(self._vel_limit_label)
+
+        # apply saved QA position/speed values now that fields exist
+        for edit, key in [(self._qa_pos_x_edit, 'qa_pos_x'),
+                          (self._qa_pos_y_edit, 'qa_pos_y'),
+                          (self._qa_pos_r_edit, 'qa_pos_r'),
+                          (self._vel_x_edit,    'vel_x'),
+                          (self._vel_y_edit,    'vel_y'),
+                          (self._vel_r_edit,    'vel_r')]:
+            if self._saved_qa_config.get(key, "") != "":
+                edit.setText(self._saved_qa_config[key])
+        ph_inner_layout.addSpacing(2)
+
         ph_card_layout.addWidget(ph_inner)
 
         self._plan_card = self._build_plan_section()
@@ -1358,27 +847,32 @@ class RunWidget(QWidget):
         ctrl_card_layout.setContentsMargins(0, 0, 0, 0)
         ctrl_card_layout.setSpacing(0)
 
-        ctrl_card_layout.addWidget(make_section_header("Controller"))
+        ctrl_card_layout.addWidget(make_section_header("Beam"))
 
         ctrl_grid = QGridLayout()
         ctrl_grid.setSpacing(8)
         ctrl_grid.setAlignment(Qt.AlignmentFlag.AlignTop)
 
-        ctrl_field_names = ["Exposure time (ms)", "Beam delay (ms)", "Loops", "Trigger Freq. (Hz)",
-                            "X step (mm)", "Y step (mm)", "R step (degree)"]
-        ctrl_keys = list(self._line_edits.keys())[7:]
-        for idx, (display, key) in enumerate(zip(ctrl_field_names, ctrl_keys)):
+        ctrl_fields = [
+            ("Exposure time (ms)", "Exposure time (ms)"),
+            ("Beam delay (ms)",    "Beam delay (ms)"),
+            ("Loops",              "Loops"),
+            ("Energy (MeV)",       "energy"),
+            ("MU",                 "MU"),
+            ("Current (nA)",       "current"),
+        ]
+        for idx, (display, key) in enumerate(ctrl_fields):
             row, col = divmod(idx, 4)
             ctrl_grid.addWidget(make_field_cell(display, self._line_edits[key]), row, col)
 
-        # Enable checkbox in slot (1, 3)
+        # Enable container — placed in footer between Launch default and Kill beam
         cb_container = QFrame()
         cb_container.setStyleSheet(INNER_CELL_STYLE)
         cb_inner = QVBoxLayout(cb_container)
         cb_inner.setContentsMargins(8, 6, 8, 6)
         cb_inner.setAlignment(Qt.AlignmentFlag.AlignCenter)
         cb_inner.addWidget(self._enable_checkbox)
-        ctrl_grid.addWidget(cb_container, 1, 3)
+        self._enable_container = cb_container
 
         ctrl_inner = QWidget()
         ctrl_inner_layout = QVBoxLayout(ctrl_inner)
@@ -1386,6 +880,8 @@ class RunWidget(QWidget):
         ctrl_inner_layout.addLayout(ctrl_grid)
         ctrl_card_layout.addWidget(ctrl_inner)
         right_layout.addWidget(ctrl_card, 1)
+        self._beam_ctrl_inner = ctrl_inner
+        self._beam_ctrl_card = ctrl_card
 
         # EUDAQ card
         eudaq_card = QFrame()
@@ -1395,16 +891,20 @@ class RunWidget(QWidget):
         eudaq_card_layout.setContentsMargins(0, 0, 0, 0)
         eudaq_card_layout.setSpacing(0)
 
-        eudaq_card_layout.addWidget(make_section_header("EUDAQ"))
+        eudaq_card_layout.addWidget(make_section_header("Sensor"))
 
         eudaq_grid = QGridLayout()
         eudaq_grid.setSpacing(8)
         eudaq_grid.setAlignment(Qt.AlignmentFlag.AlignTop)
 
-        eudaq_field_names = ["# ALPIDEs", "Events", "STROBE", "I Threshold",
-                             "Energy (MeV)", "MU", "Current (nA)"]
-        eudaq_keys = list(self._line_edits.keys())[:7]
-        for idx, (display, key) in enumerate(zip(eudaq_field_names, eudaq_keys)):
+        eudaq_fields = [
+            ("# ALPIDEs",          "num_alpides"),
+            ("Events",             "num_events"),
+            ("STROBE",             "strobe"),
+            ("I Threshold",        "ithr"),
+            ("Trigger Freq. (Hz)", "Trigger Freq. (Hz)"),
+        ]
+        for idx, (display, key) in enumerate(eudaq_fields):
             row, col = divmod(idx, 4)
             eudaq_grid.addWidget(make_field_cell(display, self._line_edits[key]), row, col)
 
@@ -1422,12 +922,27 @@ class RunWidget(QWidget):
         # ================================================================
         # FOOTER  —  self._bottom_widget
         # ================================================================
+        self._vel_estop_btn = QPushButton("⚠  Stop Rotation")
+        self._vel_estop_btn.setFixedHeight(40)
+        self._vel_estop_btn.setMinimumWidth(150)
+        self._vel_estop_btn.setStyleSheet("""
+            QPushButton { font-size: 12px; font-weight: bold; border-radius: 6px;
+                padding: 4px 16px; color: #ffffff; border: 2px solid #e53935;
+                background: #c62828; }
+            QPushButton:hover { background: #b71c1c; }
+        """)
+        self._vel_estop_btn.setVisible(False)
+        self._vel_estop_btn.clicked.connect(self._vel_emergency_stop)
+
         footer_layout = QHBoxLayout()
         footer_layout.setContentsMargins(20, 10, 20, 10)
         footer_layout.setSpacing(24)
         footer_layout.addStretch(1)
         footer_layout.addWidget(self._launch_eudaq_default)
         footer_layout.addStretch(1)
+        footer_layout.addWidget(self._enable_container)
+        footer_layout.addStretch(1)
+        footer_layout.addWidget(self._vel_estop_btn)
         footer_layout.addWidget(self._kill_beam_btn)
         footer_layout.addWidget(self._auto_kill_checkbox)
         footer_layout.addStretch(1)
@@ -1636,16 +1151,25 @@ class RunWidget(QWidget):
         body_row.setSpacing(8)
 
         # left — run list
-        self._plan_table = QTableWidget(0, 2)
+        self._plan_table = QTableWidget(0, 4)
         self._plan_table.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
         self._plan_table.setFixedHeight(190)
-        self._plan_table.setHorizontalHeaderLabels(["Run", ""])
-        self._plan_table.horizontalHeader().setSectionResizeMode(0, QHeaderView.Stretch)
-        self._plan_table.horizontalHeader().setSectionResizeMode(1, QHeaderView.ResizeToContents)
-        self._plan_table.horizontalHeader().setStyleSheet(
+        self._plan_table.setHorizontalHeaderLabels(["Run", "Attempt", "Status", "OK"])
+        _hdr = self._plan_table.horizontalHeader()
+        _hdr.setSectionResizeMode(0, QHeaderView.Stretch)
+        _hdr.setSectionResizeMode(1, QHeaderView.ResizeToContents)
+        _hdr.setSectionResizeMode(2, QHeaderView.ResizeToContents)
+        _hdr.setSectionResizeMode(3, QHeaderView.ResizeToContents)
+        _hdr.setStyleSheet(
             "QHeaderView::section { background: #2a4a6f; color: rgba(255,255,255,0.7);"
             " font-size: 10px; padding: 2px; border: none; }"
         )
+        self._plan_table.model().setHeaderData(1, Qt.Horizontal,
+            "How many times 'Load Run →' was pressed for this run", Qt.ToolTipRole)
+        self._plan_table.model().setHeaderData(2, Qt.Horizontal,
+            "Auto status: ○ pending  ► current  ✓ done", Qt.ToolTipRole)
+        self._plan_table.model().setHeaderData(3, Qt.Horizontal,
+            "Manually tick when you've verified this run is correct (un-tick to redo)", Qt.ToolTipRole)
         self._plan_table.verticalHeader().setVisible(False)
         self._plan_table.setEditTriggers(QAbstractItemView.NoEditTriggers)
         self._plan_table.setSelectionBehavior(QAbstractItemView.SelectRows)
@@ -1663,7 +1187,8 @@ class RunWidget(QWidget):
             QScrollBar::add-line:vertical, QScrollBar::sub-line:vertical { height: 0px; }
         """)
         self._plan_table.clicked.connect(self._on_plan_row_clicked)
-        body_row.addWidget(self._plan_table, 0)
+        self._plan_table.itemChanged.connect(self._on_plan_item_changed)
+        body_row.addWidget(self._plan_table, 2)
 
         # right — detail card
         self._plan_detail_label = QLabel("─── select a run ───")
@@ -1671,12 +1196,12 @@ class RunWidget(QWidget):
         self._plan_detail_label.setWordWrap(True)
         self._plan_detail_label.setStyleSheet("""
             QLabel {
-                font-size: 11px; font-family: monospace; color: #6a8098;
+                font-size: 13px; font-family: monospace; color: #6a8098;
                 background: #f4f7fb; border: 1px solid #c0cfe0;
                 border-radius: 5px; padding: 6px 8px;
             }
         """)
-        body_row.addWidget(self._plan_detail_label, 1)
+        body_row.addWidget(self._plan_detail_label, 3)
 
         inner_layout.addLayout(body_row)
 
@@ -1718,13 +1243,16 @@ class RunWidget(QWidget):
         return card
 
     def _populate_plan_table(self):
+        self._plan_table.blockSignals(True)
         self._plan_table.setRowCount(0)
         STATUS_ICON  = {"pending": "○", "current": "►", "done": "✓"}
         STATUS_COLOR = {"pending": "#4a6078", "current": "#1565C0", "done": "#2e7d32"}
-        for i, row_data in enumerate(self._plan_data):
+        for i, row_data in enumerate(self._plan_mgr.data):
             r = self._plan_table.rowCount()
             self._plan_table.insertRow(r)
-            status = self._plan_status[i]
+            status = self._plan_mgr.status[i]
+
+            # col 0 — run label
             label = row_data.get("label", "")
             run_text = row_data.get("run", str(i + 1))
             if label:
@@ -1736,42 +1264,75 @@ class RunWidget(QWidget):
             elif status == "current":
                 run_item.setForeground(QColor("#1565C0"))
             self._plan_table.setItem(r, 0, run_item)
+
+            # col 1 — attempt count
+            count = self._plan_mgr.run_counts[i] if i < len(self._plan_mgr.run_counts) else 0
+            count_item = QTableWidgetItem(f"×{count}" if count > 0 else "")
+            count_item.setTextAlignment(Qt.AlignCenter)
+            count_item.setForeground(QColor("#7a9ab0"))
+            self._plan_table.setItem(r, 1, count_item)
+
+            # col 2 — status icon
             st_item = QTableWidgetItem(STATUS_ICON.get(status, "○"))
             st_item.setTextAlignment(Qt.AlignCenter)
             st_item.setForeground(QColor(STATUS_COLOR.get(status, "#4a6078")))
-            self._plan_table.setItem(r, 1, st_item)
+            self._plan_table.setItem(r, 2, st_item)
+
+            # col 3 — OK checkbox (manual user verification)
+            chk_item = QTableWidgetItem()
+            chk_item.setFlags(Qt.ItemIsEnabled | Qt.ItemIsUserCheckable)
+            done_val = self._plan_mgr.run_done[i] if i < len(self._plan_mgr.run_done) else False
+            chk_item.setCheckState(Qt.Checked if done_val else Qt.Unchecked)
+            self._plan_table.setItem(r, 3, chk_item)
+
         self._plan_table.resizeRowsToContents()
-        self._plan_table.setFixedWidth(120)
+        self._plan_table.blockSignals(False)
+
+    @pyqtSlot()
+    def _on_plan_changed_slot(self):
+        self._populate_plan_table()
+
+    def _on_plan_item_changed(self, item):
+        if item.column() == 3 and 0 <= item.row() < len(self._plan_mgr.run_done):
+            self._plan_mgr.run_done[item.row()] = (item.checkState() == Qt.Checked)
 
     def _on_plan_row_clicked(self, index):
         idx = index.row()
-        if idx < 0 or idx >= len(self._plan_data):
+        if idx < 0 or idx >= len(self._plan_mgr.data):
             return
-        d = self._plan_data[idx]
+        d = self._plan_mgr.data[idx]
         label = d.get("label", "")
+        _mode = d.get("mode", "treatment").strip().lower()
+        _is_qa = (_mode == "qa")
+        if _is_qa:
+            _move_tip  = (f"Target  X:{d.get('qa_pos_x','—')} mm  Y:{d.get('qa_pos_y','—')} mm  R:{d.get('qa_pos_r','—')}°<br>"
+                          f"Speed   X:{d.get('vel_x','0')} mm/s  Y:{d.get('vel_y','0')} mm/s  R:{d.get('vel_r','0')} °/s")
+            _move_det  = (f"Target    X:{d.get('qa_pos_x','—')} mm  Y:{d.get('qa_pos_y','—')} mm  R:{d.get('qa_pos_r','—')}°\n"
+                          f"Speed     X:{d.get('vel_x','0')} mm/s  Y:{d.get('vel_y','0')} mm/s  R:{d.get('vel_r','0')} °/s")
+        else:
+            _move_tip  = (f"Steps   X:{d.get('X step (mm)','0')} mm  Y:{d.get('Y step (mm)','0')} mm  R:{d.get('R step (degree)','0')}°<br>"
+                          f"Ctrl    Exp:{d.get('Exposure time (ms)','?')}ms  Delay:{d.get('Beam delay (ms)','?')}ms  Loops:{d.get('Loops','?')}")
+            _move_det  = (f"Steps     X:{d.get('X step (mm)','0')} mm  Y:{d.get('Y step (mm)','0')} mm  R:{d.get('R step (degree)','0')}°\n"
+                          f"Ctrl      Exp:{d.get('Exposure time (ms)','?')} ms  Delay:{d.get('Beam delay (ms)','?')} ms  Loops:{d.get('Loops','?')}  Freq:{d.get('Trigger Freq. (Hz)','?')} Hz")
         tooltip = (
-            f"<b>Run {idx+1}" + (f" [{label}]" if label else "") + "</b><br>"
+            f"<b>Run {idx+1}" + (f" [{label}]" if label else "") + f"  [{_mode.upper()}]</b><br>"
             f"Phantom  X:{d.get('start_x','?')}  Y:{d.get('start_y','?')}  R:{d.get('start_r','?')}<br>"
-            f"Steps    X:{d.get('X step (mm)','0')}  Y:{d.get('Y step (mm)','0')}  R:{d.get('R step (degree)','0')}<br>"
+            + _move_tip + "<br>"
             f"EUDAQ    ALPIDEs:{d.get('num_alpides','?')}  Events:{d.get('num_events','?')}  "
             f"STROBE:{d.get('strobe','?')}  Thr:{d.get('ithr','?')}<br>"
-            f"Beam     Energy:{d.get('energy','?')} MeV  MU:{d.get('MU','?')}  "
-            f"Current:{d.get('current','?')} nA<br>"
-            f"Ctrl     Exp:{d.get('Exposure time (ms)','?')}ms  "
-            f"Delay:{d.get('Beam delay (ms)','?')}ms  "
-            f"Loops:{d.get('Loops','?')}  Freq:{d.get('Trigger Freq. (Hz)','?')}Hz"
+            f"Beam     Energy:{d.get('energy','?')} MeV  MU:{d.get('MU','?')}  Current:{d.get('current','?')} nA"
         )
-        for col in range(2):
+        for col in range(4):
             item = self._plan_table.item(idx, col)
             if item:
                 item.setToolTip(tooltip)
         self._plan_info_label.setText("")
         self._plan_detail_label.setText(
+            f"[{_mode.upper()}]\n"
             f"Phantom   X:{d.get('start_x','?')} mm  Y:{d.get('start_y','?')} mm  R:{d.get('start_r','?')}°\n"
-            f"Steps     X:{d.get('X step (mm)','0')} mm  Y:{d.get('Y step (mm)','0')} mm  R:{d.get('R step (degree)','0')}°\n"
+            + _move_det + "\n"
             f"EUDAQ     ALPIDEs:{d.get('num_alpides','?')}  Events:{d.get('num_events','?')}  STROBE:{d.get('strobe','?')}  Thr:{d.get('ithr','?')}\n"
-            f"Beam      Energy:{d.get('energy','?')} MeV  MU:{d.get('MU','?')}  Current:{d.get('current','?')} nA\n"
-            f"Ctrl      Exp:{d.get('Exposure time (ms)','?')} ms  Delay:{d.get('Beam delay (ms)','?')} ms  Loops:{d.get('Loops','?')}  Freq:{d.get('Trigger Freq. (Hz)','?')} Hz"
+            f"Beam      Energy:{d.get('energy','?')} MeV  MU:{d.get('MU','?')}  Current:{d.get('current','?')} nA"
         )
         self._load_run_btn.setText(f"Load Run {idx+1} →")
         self._load_run_btn.setEnabled(True)
@@ -1783,16 +1344,30 @@ class RunWidget(QWidget):
         self._load_run(idx)
 
     def _load_run(self, idx):
-        if idx < 0 or idx >= len(self._plan_data):
+        if idx < 0 or idx >= len(self._plan_mgr.data):
             return
-        row_data = self._plan_data[idx]
+        row_data = self._plan_mgr.data[idx]
         _label = row_data.get("label", "") or f"Run {idx+1}"
         self.log(f"Plan: loaded run {idx+1} [{_label}]")
+
+        # apply mode first so field locks are correct
+        _mode = row_data.get("mode", "treatment").strip().lower()
+        self._set_qa_mode(_mode == "qa")
 
         # populate all form fields
         for key in self._line_edits:
             if key in row_data and row_data[key] != "":
                 self._line_edits[key].setText(row_data[key])
+
+        # populate QA fields (position + speed)
+        for edit, key in [(self._qa_pos_x_edit, "qa_pos_x"),
+                          (self._qa_pos_y_edit, "qa_pos_y"),
+                          (self._qa_pos_r_edit, "qa_pos_r"),
+                          (self._vel_x_edit,    "vel_x"),
+                          (self._vel_y_edit,    "vel_y"),
+                          (self._vel_r_edit,    "vel_r")]:
+            if key in row_data and row_data[key] != "":
+                edit.setText(row_data[key])
 
         # set phantom go-to inputs
         sx = row_data.get("start_x", "0")
@@ -1803,22 +1378,17 @@ class RunWidget(QWidget):
         self._ph_r_edit_ctrl.setText(sr)
         self._ph_check_apply()
 
-        # update status
-        if 0 <= self._plan_current < len(self._plan_status):
-            if self._plan_status[self._plan_current] == "current":
-                self._plan_status[self._plan_current] = "done"
-        self._plan_current = idx
-        self._plan_status[idx] = "current"
-        self._populate_plan_table()
+        # update status via plan_mgr (emits plan_changed → _populate_plan_table)
+        self._plan_mgr.step_to(idx)
         self._plan_table.selectRow(idx)
 
-        done = sum(1 for s in self._plan_status if s == "done")
+        done = sum(1 for s in self._plan_mgr.status if s == "done")
         self._plan_progress_label.setText(
-            f"Run {idx + 1} / {len(self._plan_data)}  ({done} done)"
+            f"Run {idx + 1} / {len(self._plan_mgr.data)}  ({done} done)"
         )
         self._plan_info_label.setText(f"Moving → X={sx} Y={sy} R={sr}...")
         self._load_run_btn.setEnabled(False)
-        self._phantom_moving = True
+        self._phantom_panel._phantom_moving = True
 
         dlg = ZaberMoveDialog(self, f"X:{sx} mm  Y:{sy} mm  R:{sr}°")
         self._active_move_dlg = dlg
@@ -1842,7 +1412,7 @@ class RunWidget(QWidget):
 
         threading.Thread(target=_move, daemon=True).start()
         result = dlg.exec_()
-        self._phantom_moving = False
+        self._phantom_panel._phantom_moving = False
         QTimer.singleShot(0, lambda: setattr(self, '_active_move_dlg', None))
 
         if result == QDialog.Accepted:
@@ -1862,28 +1432,17 @@ class RunWidget(QWidget):
             self._show_toast("Phantom error", dlg.result_error or "Unknown error", icon="✕", icon_color="#ef5350")
 
     def _load_plan_from_file(self, fname):
-        with open(fname, newline="") as f:
-            reader = csv.DictReader(f)
-            rows = list(reader)
+        self._plan_mgr.load_file_as_dicts(fname)
+        rows = self._plan_mgr.data
         if not rows:
             QMessageBox.warning(self, "Empty Plan",
                                 "The CSV file has no runs.")
             return
-        self._plan_data = rows
-        self._plan_status = ["pending"] * len(rows)
-        self._plan_current = -1
-        self._plan_path = fname
-        import os as _os
-        self._plan_name_label.setText(
-            f"Plan: {_os.path.basename(fname)}"
-        )
-        self._plan_progress_label.setText(
-            f"0 / {len(rows)} runs"
-        )
+        self._plan_name_label.setText(f"Plan: {os.path.basename(fname)}")
+        self._plan_progress_label.setText(f"0 / {len(rows)} runs")
         self._load_run_btn.setEnabled(False)
         self._load_run_btn.setText("Load Run →")
         self._plan_info_label.setText("Select a run")
-        self._populate_plan_table()
         self._plan_card.setVisible(True)
 
     def load_plan(self):
@@ -1911,11 +1470,14 @@ class RunWidget(QWidget):
                 self._load_plan_from_file(dlg.saved_path)
 
     def close_plan(self):
+        reply = QMessageBox.question(
+            self, "ปิด Plan", "ต้องการปิด plan ใช่ไหม?",
+            QMessageBox.Yes | QMessageBox.No, QMessageBox.No
+        )
+        if reply != QMessageBox.Yes:
+            return
         self.log("Plan closed")
-        self._plan_data = []
-        self._plan_status = []
-        self._plan_current = -1
-        self._plan_path = None
+        self._plan_mgr.close()
         self._plan_card.setVisible(False)
 
     # ------------------------------------------------------------------ #
@@ -1962,7 +1524,7 @@ class RunWidget(QWidget):
 
         dlg = ZaberMoveDialog(self, f"X:{_x} mm  Y:{_y} mm  R:{_r}°")
         self._active_move_dlg = dlg
-        self._phantom_moving = True
+        self._phantom_panel._phantom_moving = True
 
         def _move():
             conn = None
@@ -1983,7 +1545,7 @@ class RunWidget(QWidget):
 
         threading.Thread(target=_move, daemon=True).start()
         result = dlg.exec_()
-        self._phantom_moving = False
+        self._phantom_panel._phantom_moving = False
         QTimer.singleShot(0, lambda: setattr(self, '_active_move_dlg', None))
 
         if result == QDialog.Accepted:
@@ -2005,6 +1567,164 @@ class RunWidget(QWidget):
         self._ph_y_edit_ctrl.setText(loc[1])
         self._ph_r_edit_ctrl.setText(loc[2])
 
+    def _vel_stop(self):
+        self._phantom_panel.vel_stop()  # state + hardware; UI handled by _on_phantom_stopped_slot
+
+    def _vel_emergency_stop(self):
+        """ใช้ได้ทั้ง manual test และระหว่าง run."""
+        if self._run_active:
+            self._vel_stop_run()
+        else:
+            self._phantom_panel.emergency_stop()
+
+    @pyqtSlot()
+    def _on_phantom_stopped_slot(self):
+        if hasattr(self, '_vel_estop_btn'):
+            self._vel_estop_btn.setVisible(False)
+
+    @pyqtSlot()
+    def _vel_reset_slot(self):
+        if hasattr(self, '_vel_estop_btn'):
+            self._vel_estop_btn.setVisible(False)
+
+    def _poll_position(self):
+        conn = self._phantom_panel._vel_conn
+        if conn is None:
+            return
+        def _thread():
+            try:
+                locs = motion.poll_positions(conn)
+                self._phantom_panel._pos_poll_result = (f"{locs[0]:.2f}", f"{locs[1]:.2f}", f"{locs[2]:.2f}")
+                QMetaObject.invokeMethod(self, "_on_pos_poll_slot", Qt.ConnectionType.QueuedConnection)
+            except Exception:
+                pass
+        threading.Thread(target=_thread, daemon=True).start()
+
+    @pyqtSlot()
+    def _on_pos_poll_slot(self):
+        r = self._phantom_panel._pos_poll_result
+        if r is None:
+            return
+        self._ph_x_label.setText(r[0])
+        self._ph_y_label.setText(r[1])
+        self._ph_r_label.setText(r[2])
+        if hasattr(self, '_ph_disp_labels'):
+            for lbl, val in zip(self._ph_disp_labels, r):
+                lbl.setText(val)
+
+    def _vel_start_run(self):
+        """Starts Zaber position move — QA mode only."""
+        if not self._window._qa_mode:
+            return
+        px_str = self._qa_pos_x_edit.text().strip()
+        py_str = self._qa_pos_y_edit.text().strip()
+        pr_str = self._qa_pos_r_edit.text().strip()
+        if not px_str and not py_str and not pr_str:
+            return
+        try:
+            sx = float(self._vel_x_edit.text() or 0)
+            sy = float(self._vel_y_edit.text() or 0)
+            sr = float(self._vel_r_edit.text() or 0)
+            px = float(px_str) if px_str and sx > 0 else None
+            py = float(py_str) if py_str and sy > 0 else None
+            pr = float(pr_str) if pr_str and sr > 0 else None
+        except ValueError:
+            return
+        if not self._window._zaber_connect:
+            return
+
+        _MAX_VX, _MAX_VY, _MAX_VR = 2.5, 2.5, 6.0
+        over = []
+        if sx > _MAX_VX: over.append(f"X: {sx} mm/s  (max {_MAX_VX} mm/s)")
+        if sy > _MAX_VY: over.append(f"Y: {sy} mm/s  (max {_MAX_VY} mm/s)")
+        if sr > _MAX_VR: over.append(f"R: {sr} °/s  (max {_MAX_VR} °/s)")
+        if over:
+            msg = QMessageBox(self)
+            msg.setIcon(QMessageBox.Icon.Critical)
+            msg.setWindowTitle("Speed limit exceeded")
+            msg.setText("Speed exceeds safe limit — cannot run.")
+            msg.setDetailedText("\n".join(over))
+            msg.setStandardButtons(QMessageBox.Ok)
+            msg.exec_()
+            return
+
+        if hasattr(self, '_vel_estop_btn'):
+            self._vel_estop_btn.setVisible(True)
+
+        def _thread():
+            import time as _t
+            import modules.ui.run_progress as _rp
+            conn = None
+            try:
+                conn = zaber_connect.connect(get_port("zaber"))
+                self._phantom_panel._vel_conn = conn
+                motion.move_to_target(conn, px, py, pr, sx, sy, sr)
+                # poll until stage stops (reached target) or emergency stop
+                while self._phantom_panel._vel_conn is not None:
+                    try:
+                        if not any(conn.get_device(d).get_axis(1).is_busy() for d in (1, 2, 3)):
+                            break
+                    except Exception:
+                        break
+                    _t.sleep(0.1)
+                # stage reached target — stop acquisition
+                if self._run_active:
+                    _rp.force_stop = True
+            except Exception as e:
+                print(f"[QA run] move_to_target error: {e}")
+                self._phantom_panel._vel_conn = None
+                try:
+                    if conn is not None:
+                        conn.close()
+                except Exception:
+                    pass
+                QMetaObject.invokeMethod(self, "_vel_estop_hide_slot",
+                    Qt.ConnectionType.QueuedConnection)
+
+        threading.Thread(target=_thread, daemon=True).start()
+
+    def _vel_stop_run(self):
+        """Auto-called at acquisition end (or emergency stop) — stops stage move."""
+        self._pos_poll_timer.stop()
+        conn = self._phantom_panel._vel_conn
+        self._phantom_panel._vel_conn = None
+        self._phantom_panel._phantom_moving = False
+        if hasattr(self, '_vel_estop_btn'):
+            self._vel_estop_btn.setVisible(False)
+        if conn is not None:
+            def _stop_thread():
+                try:
+                    motion.stop_all(conn)
+                    locs = motion.poll_positions(conn)
+                    self._phantom_panel._pos_poll_result = (f"{locs[0]:.2f}", f"{locs[1]:.2f}", f"{locs[2]:.2f}")
+                    QMetaObject.invokeMethod(self, "_on_pos_poll_slot",
+                        Qt.ConnectionType.QueuedConnection)
+                except Exception:
+                    pass
+                try:
+                    conn.close()
+                except Exception:
+                    pass
+            threading.Thread(target=_stop_thread, daemon=True).start()
+
+    @pyqtSlot()
+    def _vel_estop_hide_slot(self):
+        if hasattr(self, '_vel_estop_btn'):
+            self._vel_estop_btn.setVisible(False)
+
+    @pyqtSlot(bool)
+    def _on_camera_poll_slot(self, cam_ok):
+        self._connection["camera"].setIcon(self._connection_icons[1 if cam_ok else 0])
+        self._connection["camera"].setStyleSheet(self._connect_styles[1 if cam_ok else 0])
+
+    @pyqtSlot(bool)
+    def _on_zaber_poll_slot(self, zaber_ok):
+        if zaber_ok != self._window._zaber_connect:
+            self._window._zaber_connect = zaber_ok
+            icon_idx = 1 if zaber_ok else 0
+            self._connection["zaber"].setIcon(self._connection_icons[icon_idx])
+            self._connection["zaber"].setStyleSheet(self._connect_styles[icon_idx])
+
     def _ph_change_line_edit(self, axis):
         self._ph_check_apply()
 
@@ -2016,6 +1736,20 @@ class RunWidget(QWidget):
             self._ph_apply_btn.setEnabled(True)
         except ValueError:
             self._ph_apply_btn.setEnabled(False)
+
+    def set_zaber_max_speeds(self, speeds):
+        """speeds = (max_vx mm/s, max_vy mm/s, max_vr °/s)"""
+        self._zaber_max_speeds = speeds
+        if hasattr(self, '_vel_limit_label') and speeds:
+            mx, my, mr = speeds
+            self._vel_limit_label.setText(
+                f"max speed: {mx:.1f} mm/s  {my:.1f} mm/s  {mr:.1f} °/s")
+            for edit, val in [(self._vel_x_edit, mx),
+                              (self._vel_y_edit, my),
+                              (self._vel_r_edit, mr)]:
+                if not edit.text() or float(edit.text() or 0) == 0:
+                    safe = int(val * 100) / 100
+                    edit.setText(f"{safe:.2f}")
 
     def set_ph_loc_full(self, loc):
         """อัพเดต Current position labels เท่านั้น — ไม่แตะ Go to inputs"""
@@ -2112,24 +1846,46 @@ class RunWidget(QWidget):
             self._rsync_header_label.setStyleSheet(_base + f"QLabel {{ color: {color}; }}")
 
     @pyqtSlot(str, str)
-    def _set_rsync_status_slot(self, text, color):
+    def _on_rsync_status_slot(self, text, color):
         self._set_rsync_status(text, color)
+        if text == "rsync connected":
+            self._rsync_connected = True
+            self.log(f"rsync connected to {self._rsync_addr_edit.text().strip()}")
+            self._config.set('rsync_address', self._rsync_addr_edit.text().strip())
+            self._config.set('rsync_path', self._rsync_path_edit.text().strip())
+            self._config.save()
+        elif text in ("rsync fail", ""):
+            self._rsync_connected = False
+
+    @pyqtSlot(str)
+    def _on_rsync_failed_slot(self, err):
+        self._rsync_connected = False
+        self.log(f"rsync connection failed — {err[:120]}")
+        self._set_rsync_status("", "")
+        if self._rsync_toast:
+            self._rsync_toast.hide()
+        raw_note = f"\nRaw file saved: {os.path.basename(self._current_file)}" if self._current_file else ""
+        self._show_toast("rsync failed", err[:120] + raw_note, icon="✗", icon_color="#ef5350")
 
     @pyqtSlot(str, str)
-    def _notify_rsync_slot(self, kind, detail):
+    def _on_rsync_done_slot(self, kind, detail):
         if kind == "ok":
             self.log(f"rsync done — {detail}")
             self._show_toast("rsync done ✓", detail)
-        else:
+            if self._rsync_toast:
+                self._rsync_toast.set_done(success=True, detail=detail)
+                self._rsync_toast = None
+        elif kind == "error":
             self.log(f"rsync FAILED — {detail}")
             self._show_toast("rsync failed ✗", detail, icon="✗", icon_color="#ef5350")
-
-    @pyqtSlot(str, str)
-    def _monitor_done_slot(self, kind, detail):
-        if kind == "ok":
+            if self._rsync_toast:
+                self._rsync_toast.set_done(success=False, detail=detail)
+                self._rsync_toast = None
+            self._on_rsync_failed_slot(detail)
+        elif kind == "monitor_ok":
             self.log(f"ROOT conversion done — {detail}")
             self._show_toast("monitor done ✓", detail)
-        else:
+        elif kind == "monitor_error":
             self.log(f"ROOT conversion FAILED — {detail}")
             self._show_toast("monitor failed ✗", detail, icon="✗", icon_color="#ef5350")
 
@@ -2138,11 +1894,10 @@ class RunWidget(QWidget):
         if self._rsync_toast:
             self._rsync_toast.update_progress(pct, speed)
 
-    @pyqtSlot(str, str)
-    def _rsync_toast_done_slot(self, kind, detail):
+    @pyqtSlot(object)
+    def _on_rsync_proc_created_slot(self, proc):
         if self._rsync_toast:
-            self._rsync_toast.set_done(success=(kind == "ok"), detail=detail)
-            self._rsync_toast = None
+            self._rsync_toast.set_proc(proc)
 
     def _rsync_connect(self):
         addr = self._rsync_addr_edit.text().strip()
@@ -2159,91 +1914,7 @@ class RunWidget(QWidget):
             return
         password = pwd if pwd.strip() else None
         self.log(f"rsync connect → {addr}:{rpath}")
-        self._set_rsync_status("connecting...", "#ffd740")
-        _pwd_ssh_opts = [
-            '-o', 'StrictHostKeyChecking=no',
-            '-o', 'PreferredAuthentications=keyboard-interactive,password',
-            '-o', 'PubkeyAuthentication=no',
-        ]
-        _key_ssh_opts = ['-o', 'StrictHostKeyChecking=no']
-
-        def _do_test():
-            mkdir_cmd = f'mkdir -p "{rpath}/raw" "{rpath}/root" "{rpath}/scripts" "{rpath}/log"'
-            if password:
-                result = subprocess.run(
-                    ['sshpass', '-p', password, 'ssh'] + _pwd_ssh_opts + [addr, mkdir_cmd],
-                    stdout=subprocess.DEVNULL, stderr=subprocess.PIPE
-                )
-            else:
-                result = subprocess.run(
-                    ['ssh'] + _key_ssh_opts + [addr, mkdir_cmd],
-                    stdout=subprocess.DEVNULL, stderr=subprocess.PIPE
-                )
-            err = result.stderr.decode(errors='replace').strip()
-            if result.returncode != 0:
-                QMetaObject.invokeMethod(self, "_rsync_connect_failed_slot",
-                    Qt.ConnectionType.QueuedConnection,
-                    Q_ARG(str, err))
-                return
-            import os as _os
-            _proj_root = _os.path.normpath(
-                _os.path.join(_os.path.dirname(_os.path.abspath(__file__)), '..', '..')
-            )
-            _scripts_to_upload = [
-                _os.path.join(_proj_root, 'StdEventMonitor_fast.py'),
-                _os.path.join(_proj_root, 'run_with_stats.py'),
-            ]
-            _script_dest = f"{addr}:{rpath}/scripts/"
-            if password:
-                rsync_result = subprocess.run(
-                    ['sshpass', '-p', password, 'rsync', '-az',
-                     '-e', 'ssh ' + ' '.join(_pwd_ssh_opts)]
-                    + _scripts_to_upload + [_script_dest],
-                    stdout=subprocess.DEVNULL, stderr=subprocess.PIPE
-                )
-            else:
-                rsync_result = subprocess.run(
-                    ['rsync', '-az'] + _scripts_to_upload + [_script_dest],
-                    stdout=subprocess.DEVNULL, stderr=subprocess.PIPE
-                )
-            if rsync_result.returncode != 0:
-                err = rsync_result.stderr.decode(errors='replace').strip()
-                QMetaObject.invokeMethod(self, "_rsync_connect_failed_slot",
-                    Qt.ConnectionType.QueuedConnection,
-                    Q_ARG(str, f"Script upload failed: {err}"))
-                return
-            global _ssh_password
-            _ssh_password = password
-            try:
-                with open(self._config_path, 'r') as f:
-                    _cfg = json.load(f)
-            except (FileNotFoundError, json.JSONDecodeError):
-                _cfg = {}
-            _cfg['rsync_address'] = addr
-            _cfg['rsync_path'] = rpath
-            with open(self._config_path, 'w') as f:
-                json.dump(_cfg, f)
-            QMetaObject.invokeMethod(self, "_rsync_connected_slot", Qt.ConnectionType.QueuedConnection)
-
-        threading.Thread(target=_do_test, daemon=True).start()
-
-    @pyqtSlot()
-    def _rsync_connected_slot(self):
-        self._rsync_connected = True
-        self.log(f"rsync connected to {self._rsync_addr_edit.text().strip()}")
-        self._set_rsync_status("rsync connected", "#69f0ae")
-
-    @pyqtSlot(str)
-    def _rsync_connect_failed_slot(self, err):
-        global _ssh_password
-        _ssh_password = None
-        self._rsync_connected = False
-        self.log(f"rsync connection failed — {err[:120]}")
-        self._set_rsync_status("", "")
-        if hasattr(self, '_rsync_toast') and self._rsync_toast:
-            self._rsync_toast.hide()
-        raw_note = f"\nRaw file saved: {os.path.basename(self._current_file)}" if self._current_file else ""
-        self._show_toast("rsync failed", err[:120] + raw_note, icon="✗", icon_color="#ef5350")
+        self._rsync_mgr.connect(addr, rpath, password)
 
     def chooseOutpath(self):
         options = QFileDialog.Options()
@@ -2253,175 +1924,20 @@ class RunWidget(QWidget):
         if dirName:
             self.log(f"Output path set → {dirName}")
             self._outpath_label.setText(dirName)
-            try:
-                with open(self._config_path, 'r') as f:
-                    _cfg = json.load(f)
-            except (FileNotFoundError, json.JSONDecodeError):
-                _cfg = {}
-            _cfg['outpath'] = dirName
-            with open(self._config_path, 'w') as f:
-                json.dump(_cfg, f)
-    
-    def initUI(self):
-        main_layout = QVBoxLayout()
-        top_layout = QVBoxLayout()
-        sub_top_layout = QHBoxLayout()
-        sub_top_layout.addWidget(QWidget(), 1)
-        sub_top_layout.addWidget(self._firmware_label, 1)
-        sub_top_layout.addWidget(QWidget(), 1)
-        top_layout.addLayout(sub_top_layout)
-        self._top_widget.setLayout(top_layout)
-
-        outpath_outer_layout2 = QVBoxLayout()
-        outpath_widget = QFrame()
-        outpath_widget.setStyleSheet("""
-            QFrame{
-                border: 2px dotted rgba(0, 0, 0, 0.1);
-                border-radius: 10px;
-            }
-            QLabel{
-                border: 0px;
-                font-size: 20px
-            }
-            QPushButton {
-                font-size: 20px
-            }
-                                 """)
-        self._outpath_btn.setFixedWidth(150)
-        outpath_btn_icon = QIcon("./images/folder-open.svg")
-        self._outpath_btn.setIcon(outpath_btn_icon)
-        outpath_layout = QHBoxLayout()
-        outpath_layout.addWidget(self._outpath_label)
-        outpath_layout.addWidget(self._outpath_btn)
-        outpath_layout.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        rsync_addr_layout2 = QHBoxLayout()
-        self._rsync_connect_btn.setFixedWidth(150)
-        self._rsync_connect_btn.setIcon(QIcon("./images/link-2.svg"))
-        rsync_addr_layout2.addWidget(QLabel("SSH:"))
-        rsync_addr_layout2.addWidget(self._rsync_addr_edit, 1)
-        rsync_addr_layout2.addWidget(QLabel("Path:"))
-        rsync_addr_layout2.addWidget(self._rsync_path_edit, 1)
-        rsync_addr_layout2.addWidget(self._rsync_connect_btn)
-        rsync_addr_layout2.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        outpath_outer_layout2.addLayout(outpath_layout)
-        outpath_outer_layout2.addLayout(rsync_addr_layout2)
-        self._rsync_status_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        outpath_outer_layout2.addWidget(self._rsync_status_label)
-        outpath_widget.setLayout(outpath_outer_layout2)
-
-        bottom_layout = QVBoxLayout()
-        widget = QFrame()
-        widget.setStyleSheet("""
-            QFrame{
-                border: 2px dotted rgba(0, 0, 0, 0.1);
-                border-radius: 10px;
-            }
-            QLabel{
-                border: 0px;
-            }
-                                 """)
-
-        subsub_bottom_edit_layout = QHBoxLayout()
-        l_names = ["Number of ALPIDEs", "Number of events", "STROBE length", "I Threshold"]
-        for l_name, le_name in zip(l_names, list(self._line_edits.keys())[:4]):
-            subsubsub_bottom_edit_layout = QVBoxLayout()
-            widget = QFrame()
-            widget.setStyleSheet("""
-                QFrame {
-                    border: 1px solid rgba(33, 150, 243, 0.2);
-                    border-radius: 6px;
-                    background-color: #091828;
-                }
-                QLabel { border: none; }
-            """)
-            edit_lable = QLabel(l_name)
-            edit_lable.setAlignment(Qt.AlignmentFlag.AlignCenter)
-            edit_lable.setFixedHeight(25)
-            edit_lable.setStyleSheet("""QLabel {
-                    font-size: 13px;
-                    color: #90b4d4;
-                }""")
-            subsubsub_bottom_edit_layout.addWidget(QWidget(), 1)
-            subsubsub_bottom_edit_layout.addWidget(edit_lable)
-            edit_layout = QHBoxLayout()
-            edit_layout.addStretch()
-            edit_layout.addWidget(self._line_edits[le_name])
-            edit_layout.addStretch()
-            subsubsub_bottom_edit_layout.addLayout(edit_layout)
-            subsubsub_bottom_edit_layout.addWidget(QWidget(), 4)
-            widget.setLayout(subsubsub_bottom_edit_layout)
-            subsub_bottom_edit_layout.addWidget(widget)
-
-
-        widget_temp = QWidget()
-        widget_temp.setLayout(subsub_bottom_edit_layout)
-        bottom_layout.addWidget(widget_temp, 2)
-
-        subsub_bottom_edit_layout = QHBoxLayout()
-        l_names = ["Energy (MeV)", "MU", "Current (nA)"]
-        for l_name, le_name in zip(l_names, list(self._line_edits.keys())[4:]):
-            widget = QFrame()
-            widget.setStyleSheet("""
-                QFrame{
-                    border: 2px dotted rgba(0, 0, 0, 0.1);
-                    border-radius: 10px;
-                }
-                QLabel{
-                    border: 0px;
-                }
-                                 """)
-            subsubsub_bottom_edit_layout = QVBoxLayout()
-            edit_lable = QLabel(l_name)
-            edit_lable.setAlignment(Qt.AlignmentFlag.AlignCenter)
-            edit_lable.setFixedHeight(25)
-            edit_lable.setStyleSheet("""QLabel{
-                    font-size: 20px;
-                }""")
-            subsubsub_bottom_edit_layout.addWidget(QWidget(), 1)
-            subsubsub_bottom_edit_layout.addWidget(edit_lable)
-            edit_layout = QHBoxLayout()
-            edit_layout.addStretch()
-            edit_layout.addWidget(self._line_edits[le_name])
-            edit_layout.addStretch()
-            subsubsub_bottom_edit_layout.addLayout(edit_layout)
-            subsubsub_bottom_edit_layout.addWidget(QWidget(), 4)
-            widget.setLayout(subsubsub_bottom_edit_layout)
-            subsub_bottom_edit_layout.addWidget(widget)
-
-
-        widget_temp = QWidget()
-        widget_temp.setLayout(subsub_bottom_edit_layout)
-        bottom_layout.addWidget(widget_temp, 2)
-
-        run_btn_layout = QHBoxLayout()
-        run_btn_layout.addWidget(QWidget(), 1)
-        run_btn_layout.addWidget(self._launch_eudaq_default, 1)
-        run_btn_layout.addWidget(QWidget(), 1)
-        _kill_col = QVBoxLayout()
-        _kill_col.setAlignment(Qt.AlignCenter)
-        _kill_col.addWidget(self._kill_beam_btn)
-        _kill_col.addWidget(self._auto_kill_checkbox)
-        run_btn_layout.addLayout(_kill_col, 1)
-        run_btn_layout.addWidget(QWidget(), 1)
-        # self._kill_beam_btn.setEnabled(False)
-        # bottom_layout.addLayout(run_btn_layout, 1)
-        widget_temp = QWidget()
-        widget_temp.setLayout(run_btn_layout)
-        bottom_layout.addWidget(widget_temp, 1)
-
-        self._bottom_widget.setLayout(bottom_layout)
-        main_layout.addWidget(self._top_widget, 1)
-        main_layout.addWidget(outpath_widget, 1)
-        main_layout.addWidget(self._bottom_widget, 2)
-        self.setLayout(main_layout)
-        # self._main_widget.setLayout(main_layout)
+            self._config.set('outpath', dirName)
+            self._config.save()
     
     def _update_firmware_label(self):
         _base = "QLabel { font-size: 12px; font-weight: bold; background: transparent; border: none; padding: 3px 10px; font-family: monospace; }"
 
         # FPGA — ข้ามถ้า beam ใช้ port อยู่ เพราะ check_connection() เปิด/ปิด port ซ้อนทำให้ self._ser ถูก invalidate
         if self._ser is None or not self._ser.is_open:
-            fpga_ok = self._window.check_fpga()
+            try:
+                _fpga_port = get_port("fpga")
+                fpga_ok = fpga_connect.check_connection(_fpga_port)
+            except Exception:
+                # get_port threw — hardware not reachable; keep operator-set state
+                fpga_ok = self._window._fpga_connect
         else:
             fpga_ok = True
         if fpga_ok != self._window._fpga_connect:
@@ -2430,19 +1946,31 @@ class RunWidget(QWidget):
             self._connection["fpga"].setIcon(self._connection_icons[icon_idx])
             self._connection["fpga"].setStyleSheet(self._connect_styles[icon_idx])
 
-        # Zaber — ข้ามถ้า run อยู่หรือ phantom กำลังเคลื่อน เพราะ port ถูกใช้งานค้างไว้
-        if not self._run_active and not self._phantom_moving:
-            zaber_ok = self._window.check_zaber()
-            if zaber_ok != self._window._zaber_connect:
-                self._window._zaber_connect = zaber_ok
-                icon_idx = 1 if zaber_ok else 0
-                self._connection["zaber"].setIcon(self._connection_icons[icon_idx])
-                self._connection["zaber"].setStyleSheet(self._connect_styles[icon_idx])
+        # Zaber — ตรวจแค่ USB device presence (ไม่เปิด serial port → ไม่ conflict)
+        # get_port() สแกน OS device list เท่านั้น ใช้ได้ทั้งตอน connected และ disconnected
+        if not self._run_active and not self._phantom_panel._phantom_moving:
+            if not getattr(self, '_zaber_checking', False):
+                self._zaber_checking = True
+                def _do_zaber_check():
+                    try:
+                        get_port("zaber")
+                        ok = True
+                    except Exception:
+                        ok = False
+                    self._zaber_checking = False
+                    QMetaObject.invokeMethod(self, '_on_zaber_poll_slot',
+                        Qt.ConnectionType.QueuedConnection, Q_ARG(bool, ok))
+                threading.Thread(target=_do_zaber_check, daemon=True).start()
 
-        # Camera (status only — always clickable, never blocks anything)
-        cam_ok = self._window.check_camera()
-        self._connection["camera"].setIcon(self._connection_icons[1 if cam_ok else 0])
-        self._connection["camera"].setStyleSheet(self._connect_styles[1 if cam_ok else 0])
+        # Camera — background thread เพราะ cv2.VideoCapture(0) บล็อก UI ได้นาน
+        if not getattr(self, '_camera_checking', False):
+            self._camera_checking = True
+            def _do_camera_check():
+                ok = self._window.check_camera()
+                self._camera_checking = False
+                QMetaObject.invokeMethod(self, '_on_camera_poll_slot',
+                    Qt.ConnectionType.QueuedConnection, Q_ARG(bool, ok))
+            threading.Thread(target=_do_camera_check, daemon=True).start()
 
         # ALPIDE
         found = alpide.found_daqs()
@@ -2465,16 +1993,6 @@ class RunWidget(QWidget):
         else:
             self._firmware_label.setText("● Firmware Installed")
             self._firmware_label.setStyleSheet(_base + "QLabel { color: #a5d6a7; }")
-        # alpide_dir = "/home/santa/alpide-daq-software"
-        # command_alpide = "alpide-daq-program --fx3={}/tmp/fx3.img --fpga={}/tmp/fpga-v1.0.0.bit --all"\
-        #     .format(alpide_dir, alpide_dir)
-        # command = f'gnome-terminal -- bash -c "cd {alpide_dir} && {command_alpide}; exec bash"'
-        # process = subprocess.Popen(command_alpide, shell=True, stdout=subprocess.PIPE)
-        # out, err = process.communicate()
-        # out_lines = out.decode('utf-8').splitlines()
-        # if out_lines[0] == "No unprogrammed FX3 device found. Skipping FX3 programming step." or\
-        #     out_lines[1] == "No programmed FX3 device found. Skipping FPGA programming step.":
-        #         print("XXXX")
     
     def _open_video_window(self):
         from modules.ui.video_window import VideoWindow
@@ -2491,11 +2009,15 @@ class RunWidget(QWidget):
         self.log("Launch EUDAQ — checking connections")
         self.check_connection('alpide')
         self.check_connection('fpga')
-        connections = [
-            self._window._alpide_connect,
-            self.check_zaber_nohome(),
-            self._window._zaber_connect,
-            alpide.is_programmed()
+        _qa = self._window._qa_mode
+        if _qa:
+            connections = [self._window._alpide_connect, alpide.is_programmed()]
+        else:
+            connections = [
+                self._window._alpide_connect,
+                self.check_zaber_nohome(),
+                self._window._zaber_connect,
+                alpide.is_programmed(),
             ]
         if not all(connections):
             fail_dialog = QMessageBox()
@@ -2508,30 +2030,59 @@ class RunWidget(QWidget):
                 fail_dialog.setText("Fail to connect devices.")
                 fail_dialog.setWindowTitle("Connection issue")
                 fail_dialog.setDetailedText("Please reconnect devices.")
-            fail_dialog.setStandardButtons(QMessageBox.Ok) 
+            fail_dialog.setStandardButtons(QMessageBox.Ok)
             fail_dialog.exec_()
             return
         
-        # fpga_data = self.get_fpga_data()
-        # ser = serial.Serial(port=get_port("fpga"), baudrate=fpga_data["baudrate"], parity=fpga_data["parity"],
-        #                 bytesize=fpga_data["bytesize"], stopbits=fpga_data["stopbits"], timeout=1)
-
-        if self._enable_checkbox.checkState() != Qt.Checked:
+        if not self._window._qa_mode and self._enable_checkbox.checkState() != Qt.Checked:
             fail_dialog = QMessageBox()
             fail_dialog.setIcon(QMessageBox.Icon.Critical)
             fail_dialog.setText("Enable is off!")
             fail_dialog.setWindowTitle("KCMH error")
             fail_dialog.setDetailedText("KCMH need to be enabled.")
-            fail_dialog.setStandardButtons(QMessageBox.Ok) 
+            fail_dialog.setStandardButtons(QMessageBox.Ok)
             fail_dialog.exec_()
             self._kill_beam_btn.setChecked(False)
             return
-        
-        # for b in fpga_data["byte_start_list"]:
-        #     self._ser.write(b)
+        if self._window._qa_mode:
+            self._window.running(True)
+            self._qa_launch_time = time.monotonic()
+            if self._window._fpga_connect:
+                try:
+                    if self._ser:
+                        try:
+                            self._ser.close()
+                        except Exception:
+                            pass
+                    fpga_data = self.get_fpga_data()
+                    port = get_port("fpga")
+                    self._ser = serial.Serial(
+                        port=port, baudrate=fpga_data["baudrate"],
+                        parity=fpga_data["parity"], bytesize=fpga_data["bytesize"],
+                        stopbits=fpga_data["stopbits"], timeout=1)
+                    self._ser.write(RESET_BYTE)
+                    self._ser.write(RESET_BYTE)
+                    self._ser.write(ENABLE_BYTE)
+                    for b in fpga_data["byte_start_list"][1:]:
+                        self._ser.write(b)
+                except Exception as e:
+                    print(f"[QA] FPGA open failed — {e}")
+
         self._launch_eudaq_default.setEnabled(False)
         self._first_file = self.get_new_outfile()
         self.log("Run started — EUDAQ launching")
+        QApplication.beep()
+        _le = self._line_edits
+        print(f"[LAUNCH] {datetime.now().strftime('%H:%M:%S.%f')[:-3]}")
+        print(f"  mode={'QA' if self._window._qa_mode else 'Treatment'}")
+        for _k in ["Exposure time (ms)", "Beam delay (ms)", "Loops", "energy", "MU",
+                   "current", "num_alpides", "num_events", "strobe", "ithr"]:
+            if _k in _le:
+                print(f"  {_k}={_le[_k].text()}")
+        if self._window._qa_mode:
+            print(f"  qa_pos  X={self._qa_pos_x_edit.text()} Y={self._qa_pos_y_edit.text()} R={self._qa_pos_r_edit.text()}")
+            print(f"  qa_spd  X={self._vel_x_edit.text()} Y={self._vel_y_edit.text()} R={self._vel_r_edit.text()}")
+        self._launch_time = time.monotonic()
         self._pid = eudaq.default_run(self._line_edits, self._outpath_label.text())
         psutil.cpu_percent(interval=None)  # warm-up
         self._run_stats_start = {
@@ -2540,13 +2091,7 @@ class RunWidget(QWidget):
             'disk':     psutil.disk_io_counters(),
             'net':      psutil.net_io_counters(),
         }
-        # reset Control Room กลับ Standby เมื่อเริ่ม EUDAQ session ใหม่
-        try:
-            import modules.sim as _sim
-            if _sim.control_room is not None:
-                _sim.control_room.reset()
-        except (ImportError, AttributeError):
-            pass
+        # Control Room ไม่ reset ตรงนี้ — flow ใหม่คือรอ READY หลัง Launch
         # เริ่ม poll tmux ITS3 output (หลังจากที่ script เริ่มสร้าง session)
         self._terminal_widget.launch("ITS3", delay_ms=2000)
         # สร้าง MU tracker ไว้รอ (เฉพาะ real mode) — จะ .start() ตอนกด Run
@@ -2566,7 +2111,7 @@ class RunWidget(QWidget):
                 output_dir=self._outpath_label.text().strip(),
                 ssh_addr=self._rsync_addr_edit.text().strip(),
                 ssh_path=self._rsync_path_edit.text().strip(),
-                ssh_pass=_ssh_password or '',
+                ssh_pass=self._rsync_mgr._password or '',
                 log_fn=self.log,
                 data_fn=self._on_mu_data,
             )
@@ -2586,12 +2131,28 @@ class RunWidget(QWidget):
         
     def stop_run(self):
         self._run_active = False
+        self._vel_stop_run()  # หยุด stage ทันทีก่อนทำ log building / eudaq.stop
+        _acq_t = getattr(self, '_acq_start_time', None)
+        _acq_elapsed = f"{time.monotonic() - _acq_t:.2f}s" if _acq_t else "?"
+        print(f"[RUN END]   {datetime.now().strftime('%H:%M:%S.%f')[:-3]}  (acquisition={_acq_elapsed})")
         self._hide_progress_section()
         self.log("Run stopped")
         if hasattr(self, '_mu_tracker') and self._mu_tracker:
             self._mu_tracker.stop()
             # ไม่ set None ทันที — รอให้ TrackingWorker เสร็จแล้ว emit finished
             # แล้ว SSHWorker จึงทำงานได้ (PyQt5 weak-ref ถ้า GC ก็ไม่ได้ signal)
+        # QA mode: ส่ง disable bytes และ close serial port ทันที (ไม่มี kill beam flow)
+        if self._window._qa_mode and self._ser is not None:
+            try:
+                self._ser.write(DISABLE_BYTE)
+            except Exception:
+                pass
+            try:
+                self._ser.close()
+            except Exception:
+                pass
+            self._ser = None
+            self.log("QA: FPGA trigger disabled (\\xF2 sent)")
         # re-enable Kill beam ถ้า ser ยังอยู่ (beam อาจยังค้างอยู่หลัง run จบ)
         if self._ser is not None:
             self._kill_beam_btn.setChecked(False)  # reset state ก่อน ป้องกัน spurious trigger
@@ -2599,7 +2160,10 @@ class RunWidget(QWidget):
             self._start_auto_kill_sequence()
         if self._pid is not None:
             eudaq.stop(self._pid)  # terminal keeps logging during ~6s stop sequence
-            _toast_sub = "Auto-kill beam ใน 10 วินาที" if self._auto_kill_checkbox.isChecked() else "รอกด Kill beam"
+            if self._window._qa_mode:
+                _toast_sub = "Acquisition complete — UI unlocked"
+            else:
+                _toast_sub = "Auto-kill beam ใน 10 วินาที" if self._auto_kill_checkbox.isChecked() else "รอกด Kill beam"
             self._show_toast("Run complete ✓", _toast_sub)
         self._terminal_widget.terminate()  # close log only after EUDAQ has stopped
 
@@ -2718,148 +2282,15 @@ class RunWidget(QWidget):
             rsync_rpath = self._rsync_path_edit.text().strip()
             rsync_dest = f"{rsync_addr}:{rsync_rpath}/raw" if rsync_addr and rsync_rpath else ""
             if rsync_dest and self._current_file and self._rsync_connected:
-                import re as _re
                 from modules.ui.rsync_toast import RsyncToast
-                _rsync_pct_re = _re.compile(r'(\d+)%\s+([\d.]+\S+/s)')
-                _pwd_ssh_opts = [
-                    '-o', 'StrictHostKeyChecking=no',
-                    '-o', 'PreferredAuthentications=keyboard-interactive,password',
-                    '-o', 'PubkeyAuthentication=no',
-                ]
-                _key_ssh_opts = ['-o', 'StrictHostKeyChecking=no']
                 print(f"[rsync] {self._current_file} → {rsync_dest}")
                 fname_short = self._current_file.split('/')[-1]
                 self._rsync_toast = RsyncToast(fname_short, rsync_addr, parent=self._window)
                 self._rsync_toast.show_centered(self._window)
-
-                def _stream_rsync(proc):
-                    for raw in proc.stdout:
-                        line = raw.decode('utf-8', errors='replace').rstrip()
-                        m = _rsync_pct_re.search(line)
-                        if m:
-                            pct, speed = m.group(1), m.group(2)
-                            QMetaObject.invokeMethod(self, "_rsync_progress_slot",
-                                Qt.ConnectionType.QueuedConnection,
-                                Q_ARG(str, pct), Q_ARG(str, speed))
-                    proc.wait()
-                    return proc.returncode, proc.stderr.read()
-
-                def _upload_log_and_monitor(fname, log_content, password):
-                    import os as _os, tempfile as _tempfile
-                    fname_base = _os.path.splitext(fname)[0]
-                    remote_log     = f"{rsync_rpath}/log/{fname_base}.log"
-                    remote_raw     = f"{rsync_rpath}/raw/{fname}"
-                    remote_root    = f"{rsync_rpath}/root/{fname_base}.root"
-                    remote_wrapper = f"{rsync_rpath}/scripts/run_with_stats.py"
-                    # step 1: rsync program log
-                    with _tempfile.NamedTemporaryFile(
-                        mode='w', suffix='.log', delete=False, encoding='utf-8'
-                    ) as tf:
-                        tf.write(log_content)
-                        tmp_path = tf.name
-                    log_dest = f"{rsync_addr}:{remote_log}"
-                    print(f"[log] rsync → {log_dest}")
-                    if password:
-                        r = subprocess.run(
-                            ['sshpass', '-p', password, 'rsync', '-az',
-                             '-e', 'ssh ' + ' '.join(_pwd_ssh_opts),
-                             tmp_path, log_dest],
-                            stdout=subprocess.DEVNULL, stderr=subprocess.PIPE
-                        )
-                    else:
-                        r = subprocess.run(
-                            ['rsync', '-az', tmp_path, log_dest],
-                            stdout=subprocess.DEVNULL, stderr=subprocess.PIPE
-                        )
-                    _os.unlink(tmp_path)
-                    if r.returncode == 0:
-                        print(f"[log] done → {remote_log}")
-                    else:
-                        print(f"[log] ERROR: {r.stderr.decode(errors='replace').strip()}")
-                    # step 2: SSH append run_with_stats output
-                    cmd = (
-                        f'set -o pipefail; ~/sutpct-env/bin/python3 "{remote_wrapper}"'
-                        f' "{remote_raw}" -o "{remote_root}"'
-                        f' 2>&1 | tee -a "{remote_log}"'
-                    )
-                    print(f"[monitor] SSH → {rsync_addr}: {cmd}")
-                    if password:
-                        result = subprocess.run(
-                            ['sshpass', '-p', password, 'ssh'] + _pwd_ssh_opts + [rsync_addr, cmd],
-                            stdout=subprocess.PIPE, stderr=subprocess.STDOUT
-                        )
-                    else:
-                        result = subprocess.run(
-                            ['ssh'] + _key_ssh_opts + [rsync_addr, cmd],
-                            stdout=subprocess.PIPE, stderr=subprocess.STDOUT
-                        )
-                    if result.returncode == 0:
-                        print(f"[monitor] done → {remote_root}")
-                        QMetaObject.invokeMethod(self, "_monitor_done_slot",
-                            Qt.ConnectionType.QueuedConnection,
-                            Q_ARG(str, "ok"), Q_ARG(str, f"{fname_base}.root"))
-                    else:
-                        err_msg = result.stdout.decode(errors='replace').strip()
-                        print(f"[monitor] ERROR: {err_msg}")
-                        QMetaObject.invokeMethod(self, "_monitor_done_slot",
-                            Qt.ConnectionType.QueuedConnection,
-                            Q_ARG(str, "error"), Q_ARG(str, err_msg[:200]))
-
-                def _do_rsync(filepath, dest, password):
-                    _t0_rsync = time.monotonic()
-                    _ssh_timeout_opts = ['-o', 'ConnectTimeout=10']
-                    if password:
-                        proc = subprocess.Popen(
-                            ['sshpass', '-p', password, 'rsync', '-az', '--progress',
-                             '-e', 'ssh ' + ' '.join(_pwd_ssh_opts + _ssh_timeout_opts),
-                             filepath, dest],
-                            stdout=subprocess.PIPE, stderr=subprocess.PIPE
-                        )
-                    else:
-                        proc = subprocess.Popen(
-                            ['rsync', '-az', '--progress',
-                             '-e', 'ssh ' + ' '.join(_ssh_timeout_opts),
-                             filepath, dest],
-                            stdout=subprocess.PIPE, stderr=subprocess.PIPE
-                        )
-                    if hasattr(self, '_rsync_toast') and self._rsync_toast:
-                        self._rsync_toast.set_proc(proc)
-                    returncode, err = _stream_rsync(proc)
-                    _rsync_elapsed = time.monotonic() - _t0_rsync
-                    _rm, _rs = divmod(_rsync_elapsed, 60)
-                    _elapsed_str = f"{int(_rm):02d}:{_rs:04.1f}"
-                    if returncode == 0:
-                        print(f"[rsync] OK → {dest}  ({_elapsed_str})")
-                        _ok_detail = f"Sent to {dest.split(':')[0]}  ({_elapsed_str})"
-                        QMetaObject.invokeMethod(self, "_rsync_toast_done_slot",
-                            Qt.ConnectionType.QueuedConnection,
-                            Q_ARG(str, "ok"), Q_ARG(str, _ok_detail))
-                        QMetaObject.invokeMethod(self, "_notify_rsync_slot",
-                            Qt.ConnectionType.QueuedConnection,
-                            Q_ARG(str, "ok"), Q_ARG(str, _ok_detail))
-                        threading.Thread(target=_upload_log_and_monitor, args=(fname_short, _program_log_content, password), daemon=True).start()
-                    else:
-                        err_msg = err.decode(errors='replace').strip()
-                        print(f"[rsync] ERROR (code {returncode}): {err_msg}")
-                        global _ssh_password
-                        _ssh_password = None
-                        if returncode == 23 or 'auth' in err_msg.lower() or 'permission denied' in err_msg.lower() or 'password' in err_msg.lower():
-                            detail = f"Authentication failed — reconnect required\n{err_msg[:120]}"
-                        else:
-                            detail = f"Exit code {returncode}\n{err_msg[:120]}"
-                        QMetaObject.invokeMethod(self, "_set_rsync_status_slot",
-                            Qt.ConnectionType.QueuedConnection,
-                            Q_ARG(str, "rsync fail"), Q_ARG(str, "#ef5350"))
-                        QMetaObject.invokeMethod(self, "_rsync_toast_done_slot",
-                            Qt.ConnectionType.QueuedConnection,
-                            Q_ARG(str, "error"), Q_ARG(str, detail))
-                        QMetaObject.invokeMethod(self, "_notify_rsync_slot",
-                            Qt.ConnectionType.QueuedConnection,
-                            Q_ARG(str, "error"), Q_ARG(str, detail))
-                        QMetaObject.invokeMethod(self, "_rsync_connect_failed_slot",
-                            Qt.ConnectionType.QueuedConnection,
-                            Q_ARG(str, detail))
-                threading.Thread(target=_do_rsync, args=(self._current_file, rsync_dest, _ssh_password), daemon=True).start()
+                self._rsync_mgr.upload(
+                    self._current_file, rsync_dest, _program_log_content,
+                    fname_short, rsync_addr, rsync_rpath,
+                )
                 rsync_note = f"rsync → {rsync_addr} (sending...)"
             else:
                 print(f"[rsync] skipped — dest='{rsync_dest}' file='{self._current_file}'")
@@ -2870,6 +2301,29 @@ class RunWidget(QWidget):
             self._current_file = None
             self._show_toast("No output file", "Run stopped without saving data", icon="✗", icon_color="#ef5350")
         self._pid = None
+        self._vel_stop_run()
+        if self._window._qa_mode:
+            self._launch_eudaq_default.setEnabled(True)
+            self._window.running(False)
+            _elapsed = time.monotonic() - self._qa_launch_time if self._qa_launch_time else 0
+            self._qa_launch_time = None
+            _le = self._line_edits
+            _dlg = _QACompleteDialog(
+                self._window,
+                file_name=(self._current_file or "").split("/")[-1] or "—",
+                loops=_le["Loops"].text() if "Loops" in _le else "—",
+                elapsed_s=_elapsed,
+                energy=_le["energy"].text() if "energy" in _le else "—",
+                mu=_le["MU"].text() if "MU" in _le else "—",
+                num_alpides=_le["num_alpides"].text() if "num_alpides" in _le else "—",
+            )
+            _dlg.exec_()
+        try:
+            import modules.sim as _sim
+            if _sim.control_room is not None:
+                _sim.control_room.reset()
+        except Exception:
+            pass
 
     def get_new_outfile(self):
         try:
@@ -2883,25 +2337,18 @@ class RunWidget(QWidget):
             return None
     
     def get_fpga_data(self):
-        baudrate = 115200
-        parity = serial.PARITY_NONE
-        bytesize = serial.EIGHTBITS
-        stopbits = serial.STOPBITS_ONE
+        fpga_data = self._beam_ctrl.get_fpga_data()  # static serial params
         trigger_f_bin = bin(int(self._line_edits["Trigger Freq. (Hz)"].text())).lstrip('0b').zfill(16)
         trigger_f_byte_list = [int(trigger_f_bin[:-8], 2).to_bytes(1, 'big'), int(trigger_f_bin[-8:], 2).to_bytes(1, 'big')]
         alpide_delay_val = int(self._line_edits["Beam delay (ms)"].text())
         if alpide_delay_val > 255:
             raise ValueError(f"Beam delay {alpide_delay_val} ms เกินค่าสูงสุดที่ FPGA รองรับ (255 ms)")
         alpide_delay_byte = alpide_delay_val.to_bytes(1, 'big')
-        byte_start_list = [b'\x00', b'\x01', b'\x00', b'\x00', b'\x00', b'\x00', alpide_delay_byte, trigger_f_byte_list[0],
-            trigger_f_byte_list[1]]
-        return {
-            "baudrate": baudrate,
-            "parity": parity,
-            "bytesize": bytesize,
-            "stopbits": stopbits,
-            "byte_start_list": byte_start_list
-        }
+        fpga_data["byte_start_list"] = [
+            b'\x00', b'\x01', b'\x00', b'\x00', b'\x00', b'\x00',
+            alpide_delay_byte, trigger_f_byte_list[0], trigger_f_byte_list[1]
+        ]
+        return fpga_data
 
     def enable_beam(self):
         enabling = self._enable_checkbox.isChecked()
@@ -2926,14 +2373,14 @@ class RunWidget(QWidget):
             self._ser = serial.Serial(port=get_port("fpga"), baudrate=fpga_data["baudrate"], parity=fpga_data["parity"],
                             bytesize=fpga_data["bytesize"], stopbits=fpga_data["stopbits"], timeout=1)
             
-            self._ser.write(b'\x00')
-            self._ser.write(b'\x00')
-                
+            self._ser.write(RESET_BYTE)
+            self._ser.write(RESET_BYTE)
+
             self._kill_beam_btn.setChecked(False)
             self._stop_auto_kill_sequence()
             if self._enable_checkbox.checkState() == Qt.Checked:
                 self.log("Beam ENABLED (\\x02 sent to FPGA)")
-                self._ser.write(b'\x02')
+                self._ser.write(ENABLE_BYTE)
                 for b in fpga_data["byte_start_list"][1:]:
                     self._ser.write(b)
                 has_rsync = bool(self._rsync_addr_edit.text().strip() and self._rsync_path_edit.text().strip())
@@ -2973,7 +2420,7 @@ class RunWidget(QWidget):
                     return
                 self._stop_auto_kill_sequence()
                 self.log("Beam DISABLED (\\xF2 sent to FPGA)")
-                self._ser.write(b'\xF2')
+                self._ser.write(DISABLE_BYTE)
                 self._kill_beam_btn.setEnabled(False)
                 self._launch_eudaq_default.setEnabled(False)
                 try:
@@ -2981,6 +2428,7 @@ class RunWidget(QWidget):
                 except Exception:
                     pass
                 self._ser = None
+                self._vel_stop_run()
                 self._window.running(False)
         except ValueError as e:
             fail_dialog = QMessageBox()
@@ -3039,6 +2487,36 @@ class RunWidget(QWidget):
             self._connection["fpga"].setStyleSheet(self._connect_styles[0])
             
         self._update_firmware_label()
+
+    def _set_qa_mode(self, qa: bool):
+        self._window._qa_mode = qa
+        self._mode_treatment_btn.setStyleSheet(self._pill_inactive_style if qa else self._pill_active_style)
+        self._mode_qa_btn.setStyleSheet(self._pill_active_style if qa else self._pill_inactive_style)
+        self._enable_container.setVisible(not qa)
+        self._kill_beam_btn.setEnabled(not qa)
+        self._beam_ctrl_inner.setEnabled(not qa)
+        self._launch_eudaq_default.setEnabled(qa)
+        for edit in [self._qa_pos_x_edit, self._qa_pos_y_edit, self._qa_pos_r_edit,
+                     self._vel_x_edit, self._vel_y_edit, self._vel_r_edit]:
+            edit.setEnabled(qa)
+            edit.setVisible(qa)
+        for w in self._qa_col_widgets:
+            w.setVisible(qa)
+        # ซ่อนตัวเลขที่ไม่เกี่ยวใน QA mode
+        for key in ["Exposure time (ms)", "Beam delay (ms)", "Loops",
+                    "energy", "MU", "current",
+                    "X step (mm)", "Y step (mm)", "R step (degree)"]:
+            self._line_edits[key].setVisible(not qa)
+        loops_edit = self._line_edits["Loops"]
+        if qa:
+            self._loops_saved = loops_edit.text()
+            loops_edit.setText("1")
+            loops_edit.setEnabled(False)
+        else:
+            loops_edit.setEnabled(True)
+            if getattr(self, '_loops_saved', None):
+                loops_edit.setText(self._loops_saved)
+        self.check_connections()
 
     def check_connection(self, device):
         if device == "alpide":
@@ -3100,17 +2578,6 @@ class RunWidget(QWidget):
             return False
         
     def kill_beam_action(self):
-        # fpga_data = self.get_fpga_data()
-        # initailize serial may cause enable off
-        # ser = serial.Serial(port=get_port("fpga"), baudrate=fpga_data["baudrate"], parity=fpga_data["parity"],
-        #                 bytesize=fpga_data["bytesize"], stopbits=fpga_data["stopbits"], timeout=1)
-
-        # ser.write(b'\xEF')
-        # ser.close()
-        
-        
-        # for b in fpga_data["byte_start_list"]:
-        #         ser.write(b)
         if self._enable_checkbox.checkState() != Qt.Checked:
             fail_dialog = QMessageBox()
             fail_dialog.setIcon(QMessageBox.Icon.Critical)
@@ -3164,6 +2631,8 @@ class RunWidget(QWidget):
             if _sent:
                 if self._kill_beam_btn.isChecked():
                     self.log("Kill beam sent (\\xFE to FPGA)")
+                    _sound.play(os.path.join(_SOUND_DIR, "kill-beam.mp4"), stop_after_ms=5000)
+                    self._vel_stop_run()
                     self._launch_eudaq_default.setEnabled(False)
                     self._window.running(True)
                     # sim: เริ่ม residual delivery และ connect signal เพื่อ reset UI เมื่อเสร็จ
@@ -3201,26 +2670,26 @@ class RunWidget(QWidget):
         self._blink_state = False
         self._blink_timer.start()
         if self._auto_kill_checkbox.isChecked():
-            self._auto_kill_countdown = 10
-            self._auto_kill_timer.start()
+            self._beam_ctrl._auto_kill_countdown = 10
+            self._beam_ctrl._auto_kill_timer.start()
             self._kill_beam_btn.setText("Kill beam (10s)")
 
     def _stop_auto_kill_sequence(self):
-        self._auto_kill_timer.stop()
+        self._beam_ctrl._auto_kill_timer.stop()
         self._blink_timer.stop()
         self._kill_beam_btn.setText("Kill beam")
         self._kill_beam_btn.setStyleSheet(self._kill_beam_btn.styleSheet().replace(
             "background-color: #ff6f00;", "background-color: #c62828;"))
 
     def _tick_auto_kill(self):
-        self._auto_kill_countdown -= 1
-        if self._auto_kill_countdown <= 0:
+        self._beam_ctrl._auto_kill_countdown -= 1
+        if self._beam_ctrl._auto_kill_countdown <= 0:
             self._stop_auto_kill_sequence()
             if self._kill_beam_btn.isEnabled() and not self._kill_beam_btn.isChecked():
                 self._kill_beam_btn.setChecked(True)
                 self.kill_beam_action()
         else:
-            self._kill_beam_btn.setText(f"Kill beam ({self._auto_kill_countdown}s)")
+            self._kill_beam_btn.setText(f"Kill beam ({self._beam_ctrl._auto_kill_countdown}s)")
 
     def _tick_blink(self):
         self._blink_state = not self._blink_state
@@ -3234,14 +2703,16 @@ class RunWidget(QWidget):
     def _save_fields(self):
         """บันทึกค่า field ทั้งหมดลง config.json"""
         try:
-            try:
-                with open(self._config_path, 'r') as f:
-                    _cfg = json.load(f)
-            except (FileNotFoundError, json.JSONDecodeError):
-                _cfg = {}
-            _cfg['fields'] = {k: v.text() for k, v in self._line_edits.items()}
-            with open(self._config_path, 'w') as f:
-                json.dump(_cfg, f, indent=2)
+            self._config.set('fields', {k: v.text() for k, v in self._line_edits.items()})
+            self._config.set('qa_pos', {
+                'qa_pos_x': self._qa_pos_x_edit.text(),
+                'qa_pos_y': self._qa_pos_y_edit.text(),
+                'qa_pos_r': self._qa_pos_r_edit.text(),
+                'vel_x': self._vel_x_edit.text(),
+                'vel_y': self._vel_y_edit.text(),
+                'vel_r': self._vel_r_edit.text(),
+            })
+            self._config.save()
         except Exception:
             pass
 
@@ -3264,316 +2735,16 @@ class RunWidget(QWidget):
 
     # ── Notification bell ────────────────────────────────────────────────
 
-    def _update_bell_badge(self):
-        if self._unread_count > 0:
-            self._bell_badge.setText(str(min(self._unread_count, 99)))
-            self._bell_badge.setVisible(True)
-            self._bell_btn.setStyleSheet("""
-                QPushButton {
-                    font-size: 17px;
-                    background-color: rgba(255,71,87,0.25);
-                    border: 1px solid #ff4757;
-                    border-radius: 7px;
-                    color: #ffffff;
-                }
-                QPushButton:hover { background-color: rgba(255,71,87,0.38); }
-            """)
-        else:
-            self._bell_badge.setVisible(False)
-            self._bell_btn.setStyleSheet("""
-                QPushButton {
-                    font-size: 17px;
-                    background-color: rgba(255,255,255,0.08);
-                    border: 1px solid rgba(255,255,255,0.18);
-                    border-radius: 7px;
-                    color: #ffffff;
-                }
-                QPushButton:hover { background-color: rgba(255,255,255,0.18); }
-                QPushButton:pressed { background-color: rgba(255,255,255,0.06); }
-            """)
-
-    def _toggle_notification_panel(self):
-        if self._notif_panel is None:
-            self._build_notification_panel()
-
-        if self._notif_panel.isVisible():
-            self._notif_panel.hide()
-        else:
-            # reset unread on open
-            self._unread_count = 0
-            self._update_bell_badge()
-            self._rebuild_notif_list()
-            self._reposition_notif_panel()
-            self._notif_panel.show()
-            self._notif_panel.raise_()
-
-    def _reposition_notif_panel(self):
-        if self._notif_panel is None:
-            return
-        panel_w = self._notif_panel.width()
-        x = self.width() - panel_w - 12
-        y = 60  # just below header
-        self._notif_panel.move(x, y)
-
-    def _build_notification_panel(self):
-        """Create the floating notification panel (lazy)."""
-        panel = QFrame(self)
-        panel.setObjectName("notifPanel")
-        panel.setFixedWidth(360)
-        panel.setStyleSheet("""
-            QFrame#notifPanel {
-                background-color: #0d1a2e;
-                border: 1px solid rgba(255,255,255,0.15);
-                border-radius: 10px;
-            }
-        """)
-
-        outer_layout = QVBoxLayout(panel)
-        outer_layout.setContentsMargins(0, 0, 0, 0)
-        outer_layout.setSpacing(0)
-
-        # ── panel header bar ─────────────────────────────────────────────
-        header_bar = QFrame()
-        header_bar.setFixedHeight(42)
-        header_bar.setStyleSheet("""
-            QFrame {
-                background-color: #1e3a5f;
-                border-radius: 10px 10px 0px 0px;
-                border: none;
-            }
-            QLabel { border: none; color: #e0e8f8; font-size: 13px; font-weight: bold; }
-        """)
-        hb_layout = QHBoxLayout(header_bar)
-        hb_layout.setContentsMargins(14, 0, 10, 0)
-        hb_layout.addWidget(QLabel("🔔  Notifications"))
-        hb_layout.addStretch()
-        clear_btn = QPushButton("Clear all")
-        clear_btn.setFixedHeight(26)
-        clear_btn.setCursor(Qt.CursorShape.PointingHandCursor)
-        clear_btn.setStyleSheet("""
-            QPushButton {
-                background-color: rgba(255,255,255,0.1);
-                color: #b0c8e8;
-                border: 1px solid rgba(255,255,255,0.2);
-                border-radius: 5px;
-                font-size: 11px;
-                padding: 0px 10px;
-            }
-            QPushButton:hover { background-color: rgba(255,255,255,0.2); color: #ffffff; }
-        """)
-        clear_btn.clicked.connect(self._clear_notifications)
-        hb_layout.addWidget(clear_btn)
-        outer_layout.addWidget(header_bar)
-
-        # ── scrollable list area ─────────────────────────────────────────
-        self._notif_scroll = QScrollArea()
-        self._notif_scroll.setWidgetResizable(True)
-        self._notif_scroll.setFrameShape(QFrame.NoFrame)
-        self._notif_scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
-        self._notif_scroll.setStyleSheet("""
-            QScrollArea { background: transparent; border: none; }
-            QScrollBar:vertical {
-                background: #0d1a2e; width: 6px; margin: 0;
-            }
-            QScrollBar::handle:vertical {
-                background: rgba(255,255,255,0.2); border-radius: 3px; min-height: 20px;
-            }
-            QScrollBar::add-line:vertical, QScrollBar::sub-line:vertical { height: 0; }
-        """)
-        self._notif_list_widget = QWidget()
-        self._notif_list_widget.setStyleSheet("QWidget { background: transparent; }")
-        self._notif_list_layout = QVBoxLayout(self._notif_list_widget)
-        self._notif_list_layout.setContentsMargins(8, 8, 8, 8)
-        self._notif_list_layout.setSpacing(6)
-        self._notif_list_layout.addStretch()
-        self._notif_scroll.setWidget(self._notif_list_widget)
-        outer_layout.addWidget(self._notif_scroll)
-
-        panel.hide()
-        self._notif_panel = panel
-
-    def _rebuild_notif_list(self):
-        """Repopulate notification list items."""
-        layout = self._notif_list_layout
-        # remove all except the trailing stretch
-        while layout.count() > 1:
-            item = layout.takeAt(0)
-            if item.widget():
-                item.widget().deleteLater()
-
-        if not self._notifications:
-            empty_lbl = QLabel("No notifications yet")
-            empty_lbl.setAlignment(Qt.AlignCenter)
-            empty_lbl.setStyleSheet("QLabel { color: rgba(255,255,255,0.3); font-size: 12px; padding: 24px; border: none; }")
-            layout.insertWidget(0, empty_lbl)
-        else:
-            for i, n in enumerate(self._notifications):
-                row = self._make_notif_row(n)
-                layout.insertWidget(i, row)
-
-        # resize panel height to fit (max 420)
-        self._notif_list_widget.adjustSize()
-        desired = min(max(self._notif_list_widget.sizeHint().height() + 52, 90), 420)
-        self._notif_panel.setFixedHeight(desired)
-
-    def _make_notif_row(self, n):
-        row = QFrame()
-        row.setStyleSheet(f"""
-            QFrame {{
-                background-color: rgba(255,255,255,0.04);
-                border: 1px solid rgba(255,255,255,0.08);
-                border-left: 3px solid {n['icon_color']};
-                border-radius: 6px;
-            }}
-            QLabel {{ border: none; }}
-        """)
-        rl = QVBoxLayout(row)
-        rl.setContentsMargins(10, 7, 10, 7)
-        rl.setSpacing(3)
-
-        top_row = QHBoxLayout()
-        top_row.setSpacing(6)
-        icon_lbl = QLabel(n["icon"])
-        icon_lbl.setStyleSheet(f"QLabel {{ color: {n['icon_color']}; font-size: 13px; }}")
-        title_lbl = QLabel(n["title"])
-        title_lbl.setStyleSheet(f"QLabel {{ color: {n['icon_color']}; font-size: 12px; font-weight: bold; }}")
-        time_lbl = QLabel(n["time"])
-        time_lbl.setStyleSheet("QLabel { color: rgba(255,255,255,0.3); font-size: 10px; }")
-        top_row.addWidget(icon_lbl)
-        top_row.addWidget(title_lbl)
-        top_row.addStretch()
-        top_row.addWidget(time_lbl)
-        rl.addLayout(top_row)
-
-        if n["message"]:
-            msg_lbl = QLabel(n["message"])
-            msg_lbl.setStyleSheet("QLabel { color: #8898a8; font-size: 11px; }")
-            msg_lbl.setWordWrap(True)
-            rl.addWidget(msg_lbl)
-
-        return row
-
-    def _clear_notifications(self):
-        self._notifications.clear()
-        self._unread_count = 0
-        self._update_bell_badge()
-        self._rebuild_notif_list()
-
     def resizeEvent(self, event):
         super().resizeEvent(event)
-        # reposition toasts
-        existing = [c for c in self.children() if isinstance(c, QFrame) and c.objectName() == "toast"]
-        for i, t in enumerate(existing):
-            t.move(self.width() - t.width() - 20, 56 + i * (t.height() + 10))
-        # reposition notification panel
-        if self._notif_panel and self._notif_panel.isVisible():
-            self._reposition_notif_panel()
+        self._notif.handle_resize()
 
     def log(self, message: str):
         """Append a message to the Activity log tab."""
         self._app_log_widget.append(message)
 
-    def _show_toast(self, title, message, duration_ms=3000, icon="✓", icon_color="#00e676"):
-        """แสดง toast notification มุมขวาบน auto-dismiss"""
-        # ── record in history ────────────────────────────────────────────
-        self._notifications.insert(0, {
-            "time": datetime.now().strftime("%H:%M:%S"),
-            "title": title,
-            "message": message,
-            "icon_color": icon_color,
-            "icon": icon,
-        })
-        self._unread_count += 1
-        self._update_bell_badge()
-        if self._notif_panel and self._notif_panel.isVisible():
-            self._rebuild_notif_list()
-
-        existing = [c for c in self.children() if isinstance(c, QFrame) and c.objectName() == "toast"]
-        offset_y = 56 + sum(c.height() + 10 for c in existing)
-
-        toast = QFrame(self)
-        toast.setObjectName("toast")
-        toast.setFixedWidth(300)
-
-        # แถบสีบนสุด (accent bar ตามสี icon)
-        accent = QFrame(toast)
-        accent.setFixedHeight(4)
-        accent.setStyleSheet(f"QFrame {{ background-color: {icon_color}; border: none; border-radius: 0px; }}")
-
-        toast.setStyleSheet("""
-            QFrame#toast {
-                background-color: #0d1a2e;
-                border: 1px solid rgba(255,255,255,0.12);
-                border-radius: 10px;
-            }
-        """)
-
-        outer = QVBoxLayout(toast)
-        outer.setContentsMargins(0, 0, 0, 0)
-        outer.setSpacing(0)
-        outer.addWidget(accent)
-
-        inner = QVBoxLayout()
-        inner.setContentsMargins(14, 10, 14, 12)
-        inner.setSpacing(6)
-
-        # header: icon badge + title + close
-        header = QHBoxLayout()
-        header.setSpacing(8)
-
-        badge = QLabel(icon)
-        badge.setFixedSize(28, 28)
-        badge.setAlignment(Qt.AlignCenter)
-        badge.setStyleSheet(f"""
-            QLabel {{
-                color: {icon_color};
-                font-size: 15px;
-                font-weight: bold;
-                background-color: rgba(255,255,255,0.07);
-                border-radius: 14px;
-                border: none;
-            }}
-        """)
-
-        title_lbl = QLabel(title)
-        title_lbl.setStyleSheet(f"QLabel {{ color: {icon_color}; font-size: 13px; font-weight: bold; border: none; }}")
-
-        close_btn = QPushButton("✕")
-        close_btn.setFixedSize(22, 22)
-        close_btn.setCursor(Qt.CursorShape.PointingHandCursor)
-        close_btn.setStyleSheet("""
-            QPushButton { color: rgba(255,255,255,0.35); font-size: 12px; border: none; background: transparent; }
-            QPushButton:hover { color: #ffffff; background: rgba(255,255,255,0.1); border-radius: 11px; }
-        """)
-        close_btn.clicked.connect(toast.deleteLater)
-
-        header.addWidget(badge)
-        header.addWidget(title_lbl)
-        header.addStretch()
-        header.addWidget(close_btn)
-
-        # divider
-        div = QFrame()
-        div.setFrameShape(QFrame.HLine)
-        div.setFixedHeight(1)
-        div.setStyleSheet("QFrame { background-color: rgba(255,255,255,0.08); border: none; }")
-
-        # message
-        msg_lbl = QLabel(message)
-        msg_lbl.setStyleSheet("QLabel { color: #b0c8e8; font-size: 12px; border: none; }")
-        msg_lbl.setWordWrap(True)
-
-        inner.addLayout(header)
-        inner.addWidget(div)
-        inner.addWidget(msg_lbl)
-        outer.addLayout(inner)
-
-        toast.adjustSize()
-        toast.move(self.width() - toast.width() - 20, offset_y)
-        toast.show()
-        toast.raise_()
-
-        QTimer.singleShot(duration_ms, toast.deleteLater)
+    def _show_toast(self, title, message, duration_ms=3000, icon="\u2713", icon_color="#00e676"):
+        self._notif.show_toast(title, message, duration_ms=duration_ms, icon=icon, icon_color=icon_color)
 
     def validate_fields(self, kind):
         # if kind == "num_alpides":

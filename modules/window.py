@@ -1,9 +1,9 @@
 # modules/windows.py
-from PyQt5.QtWidgets import QMainWindow, QAction, qApp
-from PyQt5.QtCore import QTimer
+from PyQt5.QtWidgets import QMainWindow, QAction, qApp, QDialog
+from PyQt5.QtCore import Qt
 from PyQt5.QtGui import QIcon
 
-from modules.ui.run import RunWidget
+from modules.ui.run import RunWidget, ZaberMoveDialog
 
 import modules.zaber.connect as zaber_connect
 import modules.fpga.connect as fpga_connect
@@ -12,28 +12,46 @@ from modules.serial_connect import get_port
 import modules.alpide as alpide
 
 class MyWindow(QMainWindow):
-    def __init__(self):
+    def __init__(self, sim_mode=False):
         super(MyWindow, self).__init__()
         self._fpga_connect = False
         self._zaber_connect = False
         self._alpide_connect = False
         self._camera_connect = False
+        self._qa_mode = False
+        self._sim_mode = sim_mode
         self.init_connect_devices()
-        
-        try:
-            conn = zaber_connect.connect(get_port("zaber"))
-            loc = motion.get_current_locations(conn)
-            conn.close()
-            self.orig_loc = ["{:.2f}".format(l) for l in loc]
-        except:
-            self._zaber_connect = False
-            self.orig_loc = ["0"]*3
-        
+
+        if not sim_mode:
+            try:
+                dlg = ZaberMoveDialog(None, "Home  (0 mm / 0 mm / 0°)")
+                result = dlg.run_homing()
+                if result == QDialog.Accepted:
+                    self.orig_loc = ["0.00", "0.00", "0.00"]
+                else:
+                    self.orig_loc = ["0.00", "0.00", "0.00"]
+            except Exception:
+                self._zaber_connect = False
+                self.orig_loc = ["0"] * 3
+        else:
+            self.orig_loc = ["0"] * 3
+
         self.init_ui()
     
     def init_ui(self):
         self._run_widget = RunWidget(self)
+        if getattr(self, '_zaber_max_speeds', None):
+            self._run_widget.set_zaber_max_speeds(self._zaber_max_speeds)
         self.setCentralWidget(self._run_widget)
+        self.setWindowIcon(QIcon("./images/clipart4808976.png"))
+        self.setWindowFlags(
+            Qt.Window |
+            Qt.WindowTitleHint |
+            Qt.WindowSystemMenuHint |
+            Qt.WindowMinimizeButtonHint |
+            Qt.WindowMaximizeButtonHint |
+            Qt.WindowCloseButtonHint
+        )
         self.initMenuBar()
         
     def initMenuBar(self):
@@ -147,15 +165,16 @@ class MyWindow(QMainWindow):
         else:
             self._alpide_connect = False
             
-        if self.check_zaber():
-            self._zaber_connect = True
-        else:
-            self._zaber_connect = False
-            
-        if self.check_fpga():
-            self._fpga_connect = True
-        else:
-            self._fpga_connect = False
+        if not self._qa_mode:
+            if self.check_zaber():
+                self._zaber_connect = True
+            else:
+                self._zaber_connect = False
+
+            if self.check_fpga():
+                self._fpga_connect = True
+            else:
+                self._fpga_connect = False
 
         try:
             import cv2, os
@@ -176,21 +195,22 @@ class MyWindow(QMainWindow):
     def reconnect_devices(self, device):
         if device in ["zaber", "fpga", "alpide"]:
             self._run_widget.check_connection(device)
-        else: 
+        else:
             if alpide.found_daqs():
                 self._alpide_connect = True
             else:
                 self._alpide_connect = False
-                
-            if self.check_zaber():
-                self._zaber_connect = True
-            else:
-                self._zaber_connect = False
-                
-            if self.check_fpga():
-                self._fpga_connect = True
-            else:
-                self._fpga_connect = False
+
+            if not self._qa_mode:
+                if self.check_zaber():
+                    self._zaber_connect = True
+                else:
+                    self._zaber_connect = False
+
+                if self.check_fpga():
+                    self._fpga_connect = True
+                else:
+                    self._fpga_connect = False
             
             self._run_widget.check_connections()
                 
@@ -216,10 +236,34 @@ class MyWindow(QMainWindow):
 
     def check_zaber(self):
         try:
+            # ใน sim mode ให้ลอง real hardware ก่อน (ถ้าต่ออยู่จริง)
+            if self._sim_mode:
+                try:
+                    import modules.sim as _sim
+                    _real_connect = _sim._originals.get('zaber_connect.connect')
+                    _real_get_loc = _sim._originals.get('motion.get_current_locations')
+                    _real_speeds  = _sim._originals.get('motion.get_max_speeds')
+                    if _real_connect and _real_get_loc:
+                        conn = _real_connect(get_port("zaber"))
+                        loc = _real_get_loc(conn)
+                        if "_run_widget" in self.__dict__:
+                            self._run_widget.set_ph_loc_full(["{:.2f}".format(l) for l in loc])
+                            if _real_speeds:
+                                self._run_widget.set_zaber_max_speeds(_real_speeds(conn))
+                        conn.close()
+                        return True
+                except Exception:
+                    pass
             conn = zaber_connect.connect(get_port("zaber"))
             loc = motion.get_current_locations(conn)
+            try:
+                self._zaber_max_speeds = motion.get_max_speeds(conn)
+            except Exception:
+                self._zaber_max_speeds = None
             if "_run_widget" in self.__dict__:
                 self._run_widget.set_ph_loc_full(["{:.2f}".format(l) for l in loc])
+                if self._zaber_max_speeds:
+                    self._run_widget.set_zaber_max_speeds(self._zaber_max_speeds)
             conn.close()
             return True
         except:
@@ -257,11 +301,14 @@ class MyWindow(QMainWindow):
     def set_run_ph_loc(self, loc):
         self._run_widget.set_ph_loc(loc)
     
+    def closeEvent(self, event):
+        if not self._sim_mode and self._zaber_connect:
+            dlg = ZaberMoveDialog(self, "Home  (0 mm / 0 mm / 0°)")
+            dlg.run_homing()
+        event.accept()
+
     def showEvent(self, event):
         super().showEvent(event)
-        if not hasattr(self, '_size_locked'):
-            self._size_locked = True
-            QTimer.singleShot(0, lambda: self.setFixedSize(self.size()))
 
     def running(self, is_running):
         rw = self._run_widget

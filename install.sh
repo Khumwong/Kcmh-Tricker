@@ -63,7 +63,7 @@ cat > "$DESKTOP_DIR/kcmh-trigger.desktop" <<EOF
 Type=Application
 Name=KCMH Trigger
 Exec=bash -c '$PROJECT_DIR/launch_app.sh 2>&1 | tee /tmp/kcmh.log'
-Icon=$PROJECT_DIR/images/scan-eye.svg
+Icon=$PROJECT_DIR/images/clipart4808976.png
 Terminal=false
 Categories=Utility;
 EOF
@@ -75,7 +75,7 @@ cat > "$DESKTOP_DIR/kcmh-trigger-sim.desktop" <<EOF
 Type=Application
 Name=KCMH Trigger (Sim)
 Exec=bash -c '$PROJECT_DIR/launch_app.sh --sim 2>&1 | tee /tmp/kcmh-sim.log'
-Icon=$PROJECT_DIR/images/view.svg
+Icon=$PROJECT_DIR/images/clipart4808976.png
 Terminal=false
 Categories=Utility;
 EOF
