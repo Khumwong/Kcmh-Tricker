@@ -5,9 +5,10 @@ from PyQt5.QtCore import Qt
 
 
 class _QACompleteDialog(QDialog):
-    def __init__(self, parent, file_name, loops, elapsed_s, energy, mu, num_alpides):
+    def __init__(self, parent, file_name, loops, elapsed_s, energy, mu, num_alpides,
+                 title="QA Acquisition Complete"):
         super().__init__(parent)
-        self.setWindowTitle("QA Acquisition Complete")
+        self.setWindowTitle(title)
         self.setModal(True)
         self.setFixedWidth(360)
         self.setStyleSheet("""
@@ -22,7 +23,7 @@ class _QACompleteDialog(QDialog):
         header.setSpacing(10)
         icon_lbl = QLabel("✓")
         icon_lbl.setStyleSheet("color: #00e676; font-size: 26px; font-weight: bold;")
-        title_lbl = QLabel("QA Acquisition Complete")
+        title_lbl = QLabel(title)
         title_lbl.setStyleSheet("color: #ffffff; font-size: 15px; font-weight: bold;")
         header.addWidget(icon_lbl)
         header.addWidget(title_lbl)

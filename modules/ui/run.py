@@ -167,7 +167,7 @@ class RunWidget(QWidget):
         self._kill_beam_btn.setCheckable(True)
         self._kill_beam_btn.setEnabled(False)
         self._kill_beam_btn.clicked.connect(self.kill_beam_action)
-        self._auto_kill_checkbox = QCheckBox("Auto kill beam (10s)")
+        self._auto_kill_checkbox = QCheckBox("Auto kill beam (5s)")
         self._auto_kill_checkbox.setChecked(False)
         self._auto_kill_checkbox.setStyleSheet("""
             QCheckBox { font-size: 13px; color: #455a64; }
@@ -2163,7 +2163,7 @@ class RunWidget(QWidget):
             if self._window._qa_mode:
                 _toast_sub = "Acquisition complete — UI unlocked"
             else:
-                _toast_sub = "Auto-kill beam ใน 10 วินาที" if self._auto_kill_checkbox.isChecked() else "รอกด Kill beam"
+                _toast_sub = "Auto-kill beam ใน 5 วินาที" if self._auto_kill_checkbox.isChecked() else "รอกด Kill beam"
             self._show_toast("Run complete ✓", _toast_sub)
         self._terminal_widget.terminate()  # close log only after EUDAQ has stopped
 
@@ -2302,22 +2302,26 @@ class RunWidget(QWidget):
             self._show_toast("No output file", "Run stopped without saving data", icon="✗", icon_color="#ef5350")
         self._pid = None
         self._vel_stop_run()
-        if self._window._qa_mode:
+        _qa_mode = self._window._qa_mode
+        if _qa_mode:
             self._launch_eudaq_default.setEnabled(True)
             self._window.running(False)
             _elapsed = time.monotonic() - self._qa_launch_time if self._qa_launch_time else 0
             self._qa_launch_time = None
-            _le = self._line_edits
-            _dlg = _QACompleteDialog(
-                self._window,
-                file_name=(self._current_file or "").split("/")[-1] or "—",
-                loops=_le["Loops"].text() if "Loops" in _le else "—",
-                elapsed_s=_elapsed,
-                energy=_le["energy"].text() if "energy" in _le else "—",
-                mu=_le["MU"].text() if "MU" in _le else "—",
-                num_alpides=_le["num_alpides"].text() if "num_alpides" in _le else "—",
-            )
-            _dlg.exec_()
+        else:
+            _elapsed = time.monotonic() - self._launch_time if getattr(self, '_launch_time', None) else 0
+        _le = self._line_edits
+        _dlg = _QACompleteDialog(
+            self._window,
+            file_name=(self._current_file or "").split("/")[-1] or "—",
+            loops=_le["Loops"].text() if "Loops" in _le else "—",
+            elapsed_s=_elapsed,
+            energy=_le["energy"].text() if "energy" in _le else "—",
+            mu=_le["MU"].text() if "MU" in _le else "—",
+            num_alpides=_le["num_alpides"].text() if "num_alpides" in _le else "—",
+            title="QA Acquisition Complete" if _qa_mode else "Treatment Acquisition Complete",
+        )
+        _dlg.exec_()
         try:
             import modules.sim as _sim
             if _sim.control_room is not None:
@@ -2670,9 +2674,9 @@ class RunWidget(QWidget):
         self._blink_state = False
         self._blink_timer.start()
         if self._auto_kill_checkbox.isChecked():
-            self._beam_ctrl._auto_kill_countdown = 10
+            self._beam_ctrl._auto_kill_countdown = 5
             self._beam_ctrl._auto_kill_timer.start()
-            self._kill_beam_btn.setText("Kill beam (10s)")
+            self._kill_beam_btn.setText("Kill beam (5s)")
 
     def _stop_auto_kill_sequence(self):
         self._beam_ctrl._auto_kill_timer.stop()
