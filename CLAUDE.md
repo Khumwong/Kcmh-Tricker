@@ -98,7 +98,7 @@ The largest module (~4100+ lines). Contains:
 Loaded and saved by `RunWidget`. Stores: output path, rsync address/path, all run parameter field values, and ctrl fields (Planned MU, MU/min).
 
 ### Toast Popups
-- `modules/ui/firmware_toast.py` (`FirmwareToast`): modal indeterminate progress dialog during ALPIDE firmware flash
+- `modules/ui/firmware_toast.py` (`FirmwareToast`): modal indeterminate progress dialog during ALPIDE firmware flash. Has a **Cancel button, Esc handler, and hard timeout** (`eudaq.FIRMWARE_TIMEOUT_S`, default 180 s) — all three route through `_FirmwareWorker.cancel()`, which `terminate()`s then `kill()`s `alpide-daq-program`. This exists because if the DAQ boards fail to re-enumerate after the FX3 load, `alpide-daq-program` blocks forever in `select()` on its udev monitor; without a timeout that froze the whole app at startup (`install_firmware_auto()` is called from `init_connect_devices()`, before `app.exec_()`). On timeout a `QMessageBox` tells the user to power-cycle the USB hub and DAQ boards and verify with `lsusb | grep -E "04b4|1556"`. Never remove the post-`exec()` `worker.cancel()` — it's the backstop against leaving an orphan process holding the udev socket.
 - `modules/ui/rsync_toast.py` (`RsyncToast`): non-modal progress dialog with % and speed during rsync; updated via `QMetaObject.invokeMethod` from a background thread
 
 ## Automated UI Test

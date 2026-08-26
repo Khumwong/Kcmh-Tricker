@@ -172,22 +172,55 @@ class _FirmwareWorker(object):
                 super().__init__()
                 self._fx3 = fx3
                 self._fpga = fpga
+                self._proc = None
+                self._cancelled = False
                 self.success = False
+                self.timed_out = False
 
             def run(self):
-                proc = subprocess.Popen(
-                    ["alpide-daq-program", f"--fx3={self._fx3}", f"--fpga={self._fpga}", "--all"],
-                    stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True
-                )
-                for line in proc.stdout:
+                try:
+                    self._proc = subprocess.Popen(
+                        ["alpide-daq-program", f"--fx3={self._fx3}", f"--fpga={self._fpga}", "--all"],
+                        stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True
+                    )
+                except Exception as e:
+                    self.line_ready.emit(f"ERROR: {e}")
+                    self.finished_ok.emit(False)
+                    return
+                # เผื่อโดน cancel ก่อน Popen จะเสร็จ
+                if self._cancelled:
+                    self._kill()
+                for line in self._proc.stdout:
                     self.line_ready.emit(line.rstrip())
-                proc.wait()
-                self.success = proc.returncode == 0
+                self._proc.wait()
+                self.success = self._proc.returncode == 0 and not self._cancelled
                 self.finished_ok.emit(self.success)
+
+            def _kill(self):
+                p = self._proc
+                if p is None or p.poll() is not None:
+                    return
+                p.terminate()
+                try:
+                    p.wait(timeout=3)
+                except subprocess.TimeoutExpired:
+                    p.kill()
+
+            def cancel(self, timed_out=False):
+                """ฆ่า alpide-daq-program — ถ้าไม่ฆ่ามันจะเหลือเป็น orphan
+                ค้างใน select() รอ udev event ตลอดกาล (เรียกจาก main thread ได้)"""
+                if self._cancelled:
+                    return
+                self._cancelled = True
+                self.timed_out = timed_out
+                self._kill()
 
         return _Worker(fx3, fpga)
 
-def install_firmware_auto(parent_widget=None):
+FIRMWARE_TIMEOUT_S = 180
+
+
+def install_firmware_auto(parent_widget=None, timeout_s=FIRMWARE_TIMEOUT_S):
     from PyQt5.QtWidgets import QMessageBox
     from modules.ui.firmware_toast import FirmwareToast
 
@@ -208,9 +241,28 @@ def install_firmware_auto(parent_widget=None):
     worker = _FirmwareWorker(fx3, fpga)
     worker.line_ready.connect(toast.append_line)
     worker.finished_ok.connect(toast.set_done)
+    toast.cancelled.connect(lambda: worker.cancel())
+    toast.timed_out.connect(lambda: worker.cancel(timed_out=True))
+
     worker.start()
+    toast.start_timeout(timeout_s)
     toast.show_centered(parent_widget)
     toast.exec()
+
+    # กัน orphan ทุกทาง — ถ้า dialog ปิดไปโดย proc ยังไม่ตาย
+    worker.cancel()
+    worker.wait(5000)
+
+    if worker.timed_out:
+        QMessageBox.warning(
+            parent_widget,
+            "Firmware Install Timed Out",
+            f"ALPIDE firmware install ไม่จบภายใน {timeout_s} วินาที\n\n"
+            "บอร์ด DAQ น่าจะไม่ re-enumerate กลับมาหลังโหลด fx3.img\n"
+            "ลองถอดไฟ USB hub + บอร์ด DAQ แล้วเสียบใหม่ จากนั้นเช็คด้วย:\n"
+            "    lsusb | grep -E \"04b4|1556\"\n\n"
+            "ควรเห็นบอร์ดครบ 6 ตัวก่อนลองใหม่"
+        )
     return worker.success
 
 def monitor(filepath):
