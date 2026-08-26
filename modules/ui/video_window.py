@@ -165,6 +165,8 @@ class TrackingWorker(QThread):
         self.data_log    = []
         self._last_mu1   = None
         self._last_mu2   = None
+        self._pending_mu1 = None   # ค่าที่กระโดดขึ้นแต่ยังไม่ยืนยัน (รอเฟรมถัดไป >= ค่านี้)
+        self._pending_mu2 = None
         self._last_progress = None
         self._frame_count   = 0
 
@@ -366,12 +368,32 @@ class TrackingWorker(QThread):
         return None
 
     def _check_mu_pair(self, mu1, mu2):
+        # MU สะสมลดไม่ได้จริง — ดักขาลง; ขาขึ้นต้องเห็นเฟรมถัดไป >= candidate ก่อนถึงเชื่อ
+        # (กัน OCR misread โดดขึ้นแป๊บเดียวแล้วมาล็อกเป็นค่าจริงถาวรเพราะห้ามลด)
         if mu1 is not None and self._last_mu1 is not None and self._last_mu1 > 0:
-            if abs(mu1 - self._last_mu1) >= 5000 or mu1 < self._last_mu1:
+            if mu1 < self._last_mu1:
                 mu1 = self._last_mu1
+                self._pending_mu1 = None
+            elif mu1 > self._last_mu1:
+                if self._pending_mu1 is not None and mu1 >= self._pending_mu1:
+                    self._pending_mu1 = None
+                else:
+                    self._pending_mu1 = mu1
+                    mu1 = self._last_mu1
+            else:
+                self._pending_mu1 = None
         if mu2 is not None and self._last_mu2 is not None and self._last_mu2 > 0:
-            if abs(mu2 - self._last_mu2) >= 5000 or mu2 < self._last_mu2:
+            if mu2 < self._last_mu2:
                 mu2 = self._last_mu2
+                self._pending_mu2 = None
+            elif mu2 > self._last_mu2:
+                if self._pending_mu2 is not None and mu2 >= self._pending_mu2:
+                    self._pending_mu2 = None
+                else:
+                    self._pending_mu2 = mu2
+                    mu2 = self._last_mu2
+            else:
+                self._pending_mu2 = None
         if mu1 is not None and mu2 is not None and abs(mu1 - mu2) > 500:
             mu1, mu2 = self._last_mu1, self._last_mu2
         if mu1 is not None:
@@ -416,6 +438,10 @@ class TrackingWorker(QThread):
         if n is None or not (0 <= n <= 100):
             return self._last_progress, False
 
+        # progress ลดกลางลูปไม่ได้จริง (loop reset ถูกจัดการแยกไว้ข้างบนแล้ว) — ดักขาลง
+        if self._last_progress is not None and n < self._last_progress:
+            return self._last_progress, False
+
         # reject jumps > 5% upward in one step
         if (self._last_progress is not None
                 and n > self._last_progress
@@ -454,7 +480,7 @@ class SSHWorker(QThread):
     finished = pyqtSignal()
 
     def __init__(self, csv_path, ssh_addr, remote_path, password,
-                 remote_cmd='', script_path=''):
+                 remote_cmd='', script_path='', video_path=''):
         super().__init__()
         self.csv_path    = csv_path
         self.ssh_addr    = ssh_addr
@@ -462,6 +488,7 @@ class SSHWorker(QThread):
         self.password    = password
         self.remote_cmd  = remote_cmd
         self.script_path = script_path   # local path to mu_frame_v2.py
+        self.video_path  = video_path    # local path to mu_video_*.mp4 (optional)
 
     def _scp(self, local, remote_dest, label):
         cmd = ['sshpass', '-p', self.password,
@@ -513,6 +540,38 @@ class SSHWorker(QThread):
                     self.log.emit(f'SSH error: {r.stderr.strip()[:200]}')
             except Exception as e:
                 self.log.emit(f'SSH exception: {e}')
+
+        # 4. Video → SCP + รัน ocr_video.py บนเซิร์ฟเวอร์ (GPU) — best-effort,
+        #    ไม่ให้ error ตรงนี้กระทบผลลัพธ์ CSV/กราฟที่ได้ไปแล้วข้างบน
+        if self.video_path and os.path.exists(self.video_path):
+            try:
+                video_remote_dir = f'{self.remote_path}/video'
+                subprocess.run(
+                    ['sshpass', '-p', self.password, 'ssh', self.ssh_addr,
+                     '-o', 'StrictHostKeyChecking=no',
+                     f'mkdir -p {video_remote_dir}'],
+                    capture_output=True, timeout=15)
+                self._scp(self.video_path, f'{self.ssh_addr}:{video_remote_dir}/', 'video')
+
+                local_ocr_script = os.path.join(
+                    os.path.dirname(os.path.dirname(os.path.dirname(
+                        os.path.abspath(__file__)))),
+                    'ocr_video.py')
+                if os.path.exists(local_ocr_script):
+                    self._scp(local_ocr_script, f'{dest_base}/', 'ocr_video.py')
+                    remote_video = f'{video_remote_dir}/{os.path.basename(self.video_path)}'
+                    ocr_cmd = f'~/sutpct-env/bin/python3 {self.remote_path}/ocr_video.py {remote_video}'
+                    self.log.emit('SSH: กำลังรัน OCR วิดีโอบนเซิร์ฟเวอร์ (GPU)…')
+                    r = subprocess.run(
+                        ['sshpass', '-p', self.password, 'ssh', self.ssh_addr,
+                         '-o', 'StrictHostKeyChecking=no', ocr_cmd],
+                        capture_output=True, text=True, timeout=600)
+                    if r.returncode == 0:
+                        self.log.emit('SSH: OCR วิดีโอเสร็จแล้ว (ผลลัพธ์อยู่บนเซิร์ฟเวอร์ในโฟลเดอร์ video/)')
+                    else:
+                        self.log.emit(f'SSH: OCR วิดีโอ error: {r.stderr.strip()[:200]}')
+            except Exception as e:
+                self.log.emit(f'SSH: video OCR exception: {e}')
 
         self.finished.emit()
 
@@ -1097,7 +1156,8 @@ class MuTracker:
         self._log_both('MU Tracker: กำลัง SCP CSV → server…')
         self._ssh_worker = SSHWorker(
             csv_path, self._ssh_addr, self._ssh_path, self._ssh_pass,
-            remote_cmd=remote_cmd, script_path=local_script)
+            remote_cmd=remote_cmd, script_path=local_script,
+            video_path=self._video_path)
         self._ssh_worker.log.connect(self._log_both)
         self._ssh_worker.finished.connect(self._on_ssh_done)
         self._ssh_worker.start()

@@ -2,7 +2,7 @@
 """
 ocr_video.py — รันบน physics server (GPU)
 Usage: python3 ocr_video.py <mu_video_*.mp4> [--max-frames N]
-Output: CSV ชื่อเดียวกับ video ใน directory เดียวกัน
+Output: CSV + PNG ชื่อเดียวกับ video ใน directory เดียวกัน
 
 ROI order in video (top→bottom):
   0: mu1_mu2_roi
@@ -60,6 +60,79 @@ def validate_progress(text):
     return None
 
 
+class _MuPairFilter:
+    """MU สะสมลดไม่ได้จริง — ดักขาลง; ขาขึ้นต้องเห็นเฟรมถัดไป >= candidate ก่อนถึงเชื่อ
+    (กัน OCR misread โดดขึ้นแป๊บเดียวแล้วมาล็อกเป็นค่าจริงถาวรเพราะห้ามลด)
+    พอร์ตมาจาก TrackingWorker._check_mu_pair() ใน modules/ui/video_window.py
+    """
+    def __init__(self):
+        self.last1 = self.last2 = None
+        self.pend1 = self.pend2 = None
+
+    def _step(self, val, last, pend):
+        if val is not None and last is not None and last > 0:
+            if val < last:
+                val = last; pend = None
+            elif val > last:
+                if pend is not None and val >= pend:
+                    pend = None
+                else:
+                    pend = val; val = last
+            else:
+                pend = None
+        return val, pend
+
+    def apply(self, mu1, mu2):
+        mu1, self.pend1 = self._step(mu1, self.last1, self.pend1)
+        mu2, self.pend2 = self._step(mu2, self.last2, self.pend2)
+        if mu1 is not None and mu2 is not None and abs(mu1 - mu2) > 500:
+            mu1, mu2 = self.last1, self.last2
+        if mu1 is not None:
+            self.last1 = mu1
+        if mu2 is not None:
+            self.last2 = mu2
+        return mu1, mu2
+
+
+# ── plot ──────────────────────────────────────────────────────────────────────
+
+def _make_plot(rows, out_png):
+    import matplotlib
+    matplotlib.use('Agg')
+    import matplotlib.pyplot as plt
+
+    t      = [r['time_sec'] for r in rows]
+    mu1    = [r['mu1'] for r in rows]
+    mu2    = [r['mu2'] for r in rows]
+    mu1_f  = [r['mu1_filtered'] for r in rows]
+    mu2_f  = [r['mu2_filtered'] for r in rows]
+    rate   = [r['mu_rate'] for r in rows]
+    prog   = [r['progress'] for r in rows]
+
+    fig, axes = plt.subplots(3, 1, figsize=(14, 12), sharex=True)
+
+    axes[0].plot(t, mu1, '.', color='cyan', markersize=3, alpha=0.3, label='MU1 raw')
+    axes[0].plot(t, mu2, '.', color='orange', markersize=3, alpha=0.3, label='MU2 raw')
+    axes[0].plot(t, mu1_f, '-', color='blue', linewidth=1.6, label='MU1 filtered')
+    axes[0].plot(t, mu2_f, '-', color='red', linewidth=1.6, label='MU2 filtered')
+    axes[0].set_ylabel('MU1 / MU2')
+    axes[0].set_title('MU1/MU2 — offline (every frame, GPU)  raw vs filtered (decrease-guard + debounce)')
+    axes[0].legend(fontsize=8)
+
+    axes[1].plot(t, rate, '.', color='green', markersize=4)
+    axes[1].set_ylabel('mu_rate')
+    axes[1].set_title('mu_rate')
+
+    axes[2].plot(t, prog, '.', color='purple', markersize=3)
+    axes[2].set_ylabel('progress %')
+    axes[2].set_xlabel('time (s)')
+    axes[2].set_title('progress')
+
+    plt.tight_layout()
+    plt.savefig(out_png, dpi=110)
+    print(f'[ocr_video] plot → {out_png}')
+
+
 # ── main ──────────────────────────────────────────────────────────────────────
 
 def process(video_path, max_frames=None):
@@ -87,7 +160,9 @@ def process(video_path, max_frames=None):
     start_dt = datetime.strptime(m.group(1), '%Y%m%d_%H%M%S') if m else None
 
     out_path = os.path.splitext(video_path)[0] + '_ocr.csv'
+    out_png  = os.path.splitext(video_path)[0] + '_ocr.png'
     rows = []
+    mu_filter = _MuPairFilter()
 
     def ocr(strip, scale=2):
         h, w = strip.shape[:2]
@@ -113,11 +188,13 @@ def process(video_path, max_frames=None):
         mu2  = validate_mu(mu2_texts[0] if mu2_texts else None)
         rate = validate_mu_rate(rate_texts[0] if rate_texts else None)
         prog = validate_progress(prog_texts[0] if prog_texts else None)
+        mu1_f, mu2_f = mu_filter.apply(mu1, mu2)
 
         dt_str = (start_dt + timedelta(seconds=t_sec)).strftime('%Y-%m-%d %H:%M:%S.%f')[:-3] if start_dt else None
         rows.append({
             'frame': frame_idx, 'time_sec': round(t_sec, 3), 'datetime': dt_str,
-            'mu1': mu1, 'mu2': mu2, 'mu_rate': rate, 'progress': prog,
+            'mu1': mu1, 'mu2': mu2, 'mu1_filtered': mu1_f, 'mu2_filtered': mu2_f,
+            'mu_rate': rate, 'progress': prog,
         })
 
         if frame_idx % 100 == 0 or mu1 or mu2 or rate or prog:
@@ -133,6 +210,11 @@ def process(video_path, max_frames=None):
         w.writeheader()
         w.writerows(rows)
     print(f'[ocr_video] done → {out_path}')
+
+    try:
+        _make_plot(rows, out_png)
+    except Exception as e:
+        print(f'[ocr_video] plot failed (CSV still saved OK): {e}')
 
 
 if __name__ == '__main__':
