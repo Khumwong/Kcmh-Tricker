@@ -46,15 +46,15 @@ class RsyncManager(QObject):
         ).start()
 
     def upload(self, filepath: str, dest: str, log_content: str, fname_short: str,
-               addr: str, rpath: str):
-        """rsync file to dest, then upload log + run ROOT conversion.
+               addr: str, rpath: str, zaber_csv_content: str = None):
+        """rsync file to dest, then upload log + zaber CSV + run ROOT conversion.
 
         Emits proc_created(proc) on the GUI thread shortly after rsync starts,
         so callers can attach the proc to RsyncToast for cancel support.
         """
         threading.Thread(
             target=self._do_rsync,
-            args=(filepath, dest, log_content, fname_short, addr, rpath, self._password),
+            args=(filepath, dest, log_content, fname_short, addr, rpath, self._password, zaber_csv_content),
             daemon=True
         ).start()
 
@@ -64,7 +64,7 @@ class RsyncManager(QObject):
         import os as _os
         _test_timeout = ['-o', 'ConnectTimeout=3']
         mkdir_cmd = (
-            f'mkdir -p "{rpath}/raw" "{rpath}/root" "{rpath}/scripts" "{rpath}/log"'
+            f'mkdir -p "{rpath}/raw" "{rpath}/root" "{rpath}/scripts" "{rpath}/log" "{rpath}/zaber" "{rpath}/plots"'
         )
         if password:
             result = subprocess.run(
@@ -90,6 +90,7 @@ class RsyncManager(QObject):
         scripts = [
             _os.path.join(_proj_root, 'StdEventMonitor_fast.py'),
             _os.path.join(_proj_root, 'run_with_stats.py'),
+            _os.path.join(_proj_root, 'plot_hits_with_position_axis.py'),
         ]
         script_dest = f"{addr}:{rpath}/scripts/"
         if password:
@@ -126,7 +127,7 @@ class RsyncManager(QObject):
         proc.wait()
         return proc.returncode, proc.stderr.read()
 
-    def _do_rsync(self, filepath, dest, log_content, fname_short, addr, rpath, password):
+    def _do_rsync(self, filepath, dest, log_content, fname_short, addr, rpath, password, zaber_csv_content=None):
         import time as _time
         t0 = _time.monotonic()
         if password:
@@ -155,7 +156,7 @@ class RsyncManager(QObject):
             self.done.emit("ok", ok_detail)
             threading.Thread(
                 target=self._upload_log_and_monitor,
-                args=(fname_short, log_content, addr, rpath, password),
+                args=(fname_short, log_content, addr, rpath, password, zaber_csv_content),
                 daemon=True
             ).start()
         else:
@@ -172,12 +173,13 @@ class RsyncManager(QObject):
             self.status_changed.emit("rsync fail", "#ef5350")
             self.done.emit("error", detail)
 
-    def _upload_log_and_monitor(self, fname, log_content, addr, rpath, password):
+    def _upload_log_and_monitor(self, fname, log_content, addr, rpath, password, zaber_csv_content=None):
         import os as _os, tempfile as _tempfile
         fname_base     = _os.path.splitext(fname)[0]
         remote_log     = f"{rpath}/log/{fname_base}.log"
         remote_raw     = f"{rpath}/raw/{fname}"
         remote_root    = f"{rpath}/root/{fname_base}.root"
+        remote_zaber   = f"{rpath}/zaber/{fname_base}_zaber.csv"
         remote_wrapper = f"{rpath}/scripts/run_with_stats.py"
 
         # step 1: rsync program log
@@ -205,10 +207,38 @@ class RsyncManager(QObject):
         else:
             print(f"[log] ERROR: {r.stderr.decode(errors='replace').strip()}")
 
+        # step 1b: rsync zaber position CSV (optional — not present in QA mode / no stage moves)
+        _zaber_arg = ""
+        if zaber_csv_content:
+            with _tempfile.NamedTemporaryFile(
+                mode='w', suffix='.csv', delete=False, encoding='utf-8'
+            ) as zf:
+                zf.write(zaber_csv_content)
+                zaber_tmp_path = zf.name
+            zaber_dest = f"{addr}:{remote_zaber}"
+            if password:
+                zr = subprocess.run(
+                    ['sshpass', '-p', password, 'rsync', '-az',
+                     '-e', 'ssh ' + ' '.join(_PWD_SSH_OPTS),
+                     zaber_tmp_path, zaber_dest],
+                    stdout=subprocess.DEVNULL, stderr=subprocess.PIPE
+                )
+            else:
+                zr = subprocess.run(
+                    ['rsync', '-az', zaber_tmp_path, zaber_dest],
+                    stdout=subprocess.DEVNULL, stderr=subprocess.PIPE
+                )
+            _os.unlink(zaber_tmp_path)
+            if zr.returncode == 0:
+                print(f"[zaber] done → {remote_zaber}")
+                _zaber_arg = f' --zaber-csv "{remote_zaber}"'
+            else:
+                print(f"[zaber] ERROR: {zr.stderr.decode(errors='replace').strip()}")
+
         # step 2: SSH run_with_stats
         cmd = (
             f'set -o pipefail; ~/sutpct-env/bin/python3 "{remote_wrapper}"'
-            f' "{remote_raw}" -o "{remote_root}"'
+            f' "{remote_raw}" -o "{remote_root}"{_zaber_arg}'
             f' 2>&1 | tee -a "{remote_log}"'
         )
         if password:
@@ -223,6 +253,30 @@ class RsyncManager(QObject):
             )
         if result.returncode == 0:
             self.done.emit("monitor_ok", f"{fname_base}.root")
+
+            # step 3: SSH plot_hits_with_position_axis.py — best-effort, never fails the run
+            if _zaber_arg:
+                remote_plot_script = f"{rpath}/scripts/plot_hits_with_position_axis.py"
+                remote_plot_png = f"{rpath}/plots/{fname_base}_hits_with_position.png"
+                plot_cmd = (
+                    f'mkdir -p "{rpath}/plots"; ~/sutpct-env/bin/python3 "{remote_plot_script}"'
+                    f' "{remote_root}" "{remote_zaber}" -o "{remote_plot_png}"'
+                    f' 2>&1 | tee -a "{remote_log}"'
+                )
+                if password:
+                    plot_result = subprocess.run(
+                        ['sshpass', '-p', password, 'ssh'] + _PWD_SSH_OPTS + [addr, plot_cmd],
+                        stdout=subprocess.PIPE, stderr=subprocess.STDOUT
+                    )
+                else:
+                    plot_result = subprocess.run(
+                        ['ssh'] + _KEY_SSH_OPTS + [addr, plot_cmd],
+                        stdout=subprocess.PIPE, stderr=subprocess.STDOUT
+                    )
+                if plot_result.returncode == 0:
+                    print(f"[plot] done → {remote_plot_png}")
+                else:
+                    print(f"[plot] skipped/failed: {plot_result.stdout.decode(errors='replace').strip()[:200]}")
         else:
             err_msg = result.stdout.decode(errors='replace').strip()
             self.done.emit("monitor_error", err_msg[:200])

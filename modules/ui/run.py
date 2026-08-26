@@ -62,6 +62,9 @@ class RunWidget(QWidget):
         self._first_file = None
         self._run_stats_start = None
         self._qa_launch_time = None
+        self._zaber_log = []
+        self._run_start_epoch = None
+        self._run_stop_epoch = None
         self._zaber_max_speeds = None
         self._checks = [0, 0]
         self._beam_ctrl = BeamController(parent=self)
@@ -2083,6 +2086,11 @@ class RunWidget(QWidget):
             print(f"  qa_pos  X={self._qa_pos_x_edit.text()} Y={self._qa_pos_y_edit.text()} R={self._qa_pos_r_edit.text()}")
             print(f"  qa_spd  X={self._vel_x_edit.text()} Y={self._vel_y_edit.text()} R={self._vel_r_edit.text()}")
         self._launch_time = time.monotonic()
+        self._zaber_log = []
+        # NOT stamped here — FPGA doesn't send trigger bytes (so no events exist yet)
+        # until Start Acquisition. Set for real in RunProgress._start_worker().
+        self._run_start_epoch = None
+        self._run_stop_epoch = None
         self._pid = eudaq.default_run(self._line_edits, self._outpath_label.text())
         psutil.cpu_percent(interval=None)  # warm-up
         self._run_stats_start = {
@@ -2158,6 +2166,7 @@ class RunWidget(QWidget):
             self._kill_beam_btn.setChecked(False)  # reset state ก่อน ป้องกัน spurious trigger
             self._kill_beam_btn.setEnabled(True)
             self._start_auto_kill_sequence()
+        self._run_stop_epoch = time.time()
         if self._pid is not None:
             eudaq.stop(self._pid)  # terminal keeps logging during ~6s stop sequence
             if self._window._qa_mode:
@@ -2290,6 +2299,7 @@ class RunWidget(QWidget):
                 self._rsync_mgr.upload(
                     self._current_file, rsync_dest, _program_log_content,
                     fname_short, rsync_addr, rsync_rpath,
+                    zaber_csv_content=self._build_zaber_csv_content(),
                 )
                 rsync_note = f"rsync → {rsync_addr} (sending...)"
             else:
@@ -2336,6 +2346,20 @@ class RunWidget(QWidget):
                 _sim.control_room.reset()
         except Exception:
             pass
+
+    def log_zaber_step(self, step_index, x, y, r):
+        """เก็บตำแหน่ง Zaber จริง (post-move) พร้อมเวลา wall-clock — ใช้ map event↔ตำแหน่งฝั่ง server"""
+        self._zaber_log.append((time.time(), step_index, x, y, r))
+
+    def _build_zaber_csv_content(self):
+        lines = [
+            f"# run_start_epoch={self._run_start_epoch or 0.0}",
+            f"# run_stop_epoch={self._run_stop_epoch or 0.0}",
+            "epoch,step_index,x_mm,y_mm,r_deg",
+        ]
+        for epoch, step_index, x, y, r in self._zaber_log:
+            lines.append(f"{epoch},{step_index},{x:.4f},{y:.4f},{r:.4f}")
+        return "\n".join(lines) + "\n"
 
     def get_new_outfile(self):
         try:
