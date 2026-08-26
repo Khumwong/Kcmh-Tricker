@@ -217,12 +217,57 @@ def process(video_path, max_frames=None):
         print(f'[ocr_video] plot failed (CSV still saved OK): {e}')
 
 
+# ── save_sample_frames — diagnostic: dump ROI crops for visual inspection ──────
+
+# scale factor OCR actually reads at (matches ocr() calls in process())
+_ROI_SCALE = {'mu1_roi': 4, 'mu2_roi': 4, 'mu_rate_roi': 2, 'progress_roi': 2}
+
+def save_sample_frames(video_path, n_frames=100):
+    """เก็บภาพ ROI แต่ละอันจาก n_frames เฟรม (กระจายทั่วคลิป) แยกโฟลเดอร์ต่อ ROI
+    ไว้ดูด้วยตาว่าตัวเลขชัดแค่ไหน — scale ที่ resize เท่ากับที่ OCR ใช้จริง"""
+    cap = cv2.VideoCapture(video_path)
+    if not cap.isOpened():
+        print(f'[ocr_video] ERROR: cannot open {video_path}')
+        return
+
+    total = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+    n = min(n_frames, total)
+    step = max(1, total // n)
+    picked = list(range(0, total, step))[:n]
+
+    out_dir = os.path.splitext(video_path)[0] + '_frames'
+    for name in ROI_NAMES:
+        os.makedirs(os.path.join(out_dir, name), exist_ok=True)
+
+    saved = 0
+    for frame_idx in picked:
+        cap.set(cv2.CAP_PROP_POS_FRAMES, frame_idx)
+        ret, frame = cap.read()
+        if not ret:
+            continue
+        for i, name in enumerate(ROI_NAMES):
+            strip = frame[CROP_H * i: CROP_H * (i + 1), :]
+            scale = _ROI_SCALE[name]
+            h, w = strip.shape[:2]
+            big = cv2.resize(strip, (w * scale, h * scale), interpolation=cv2.INTER_CUBIC)
+            cv2.imwrite(os.path.join(out_dir, name, f'frame_{frame_idx:05d}.jpg'), big)
+        saved += 1
+
+    cap.release()
+    print(f'[ocr_video] saved {saved} frames × {len(ROI_NAMES)} ROIs → {out_dir}/<roi_name>/')
+
+
 if __name__ == '__main__':
     if len(sys.argv) < 2:
-        print('Usage: python3 ocr_video.py <mu_video_*.mp4> [--max-frames N]')
+        print('Usage: python3 ocr_video.py <mu_video_*.mp4> [--max-frames N] [--save-frames N]')
         sys.exit(1)
-    max_f = None
-    if '--max-frames' in sys.argv:
-        idx = sys.argv.index('--max-frames')
-        max_f = int(sys.argv[idx + 1])
-    process(sys.argv[1], max_frames=max_f)
+    if '--save-frames' in sys.argv:
+        idx = sys.argv.index('--save-frames')
+        n = int(sys.argv[idx + 1])
+        save_sample_frames(sys.argv[1], n_frames=n)
+    else:
+        max_f = None
+        if '--max-frames' in sys.argv:
+            idx = sys.argv.index('--max-frames')
+            max_f = int(sys.argv[idx + 1])
+        process(sys.argv[1], max_frames=max_f)
