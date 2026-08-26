@@ -2311,7 +2311,10 @@ class RunWidget(QWidget):
         else:
             _elapsed = time.monotonic() - self._launch_time if getattr(self, '_launch_time', None) else 0
         _le = self._line_edits
-        _dlg = _QACompleteDialog(
+        _prev_dlg = getattr(self, '_run_complete_dlg', None)
+        if _prev_dlg is not None:
+            _prev_dlg.close()  # ปิด popup รอบก่อนที่ยังค้างอยู่ ไม่ให้สะสม (non-modal)
+        self._run_complete_dlg = _QACompleteDialog(
             self._window,
             file_name=(self._current_file or "").split("/")[-1] or "—",
             loops=_le["Loops"].text() if "Loops" in _le else "—",
@@ -2320,8 +2323,13 @@ class RunWidget(QWidget):
             mu=_le["MU"].text() if "MU" in _le else "—",
             num_alpides=_le["num_alpides"].text() if "num_alpides" in _le else "—",
             title="QA Acquisition Complete" if _qa_mode else "Treatment Acquisition Complete",
+            modal=_qa_mode,
         )
-        _dlg.exec_()
+        if _qa_mode:
+            self._run_complete_dlg.exec_()
+        else:
+            # non-modal — ต้องไม่บล็อก Kill beam button ถ้า beam ยังค้างอยู่
+            self._run_complete_dlg.show()
         try:
             import modules.sim as _sim
             if _sim.control_room is not None:
