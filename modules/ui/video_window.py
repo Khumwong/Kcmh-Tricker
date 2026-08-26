@@ -212,8 +212,12 @@ class TrackingWorker(QThread):
                 if self.rotate:
                     frame = cv2.rotate(frame, cv2.ROTATE_180)
 
-                plan1 = plan2 = mu1 = mu2 = mu_rate = progress = None
-                date_text = time_text = None  # noqa: kept for CSV schema compat
+                mu1 = mu2 = mu_rate = progress = None
+                # เวลาจริงจากนาฬิกาเครื่อง — เทียบกับ raw file ได้ตรงๆ (ไม่ OCR วันเวลาจากภาพ
+                # เพราะ FOV ต่ำ/เบลอ อ่านไม่ได้อยู่แล้ว)
+                _now = datetime.now()
+                date_text = _now.strftime('%Y-%m-%d')
+                time_text = _now.strftime('%H:%M:%S.%f')[:-3]
 
                 if rois.get('mu1_roi'):
                     r = self._ocr_one(reader, frame, rois['mu1_roi'])
@@ -221,6 +225,7 @@ class TrackingWorker(QThread):
                 if rois.get('mu2_roi'):
                     r = self._ocr_one(reader, frame, rois['mu2_roi'])
                     mu2 = self._validate_mu(r)
+                mu1, mu2 = self._check_mu_pair(mu1, mu2)
 
                 if rois.get('mu_rate_roi'):
                     r = self._ocr_one(reader, frame, rois['mu_rate_roi'])
@@ -228,14 +233,13 @@ class TrackingWorker(QThread):
 
                 if rois.get('progress_roi'):
                     r = self._ocr_one(reader, frame, rois['progress_roi'])
-                    progress, loop_done = self._validate_progress(r, plan1, plan2)
+                    progress, loop_done = self._validate_progress(r)
                     if loop_done:
                         self.log.emit('Loop complete (progress reset detected)')
                         self.loop_complete.emit()
 
                 entry = {
                     'frame':    self._frame_count,
-                    'plan1':    plan1,  'plan2':    plan2,
                     'mu1':      mu1,    'mu2':      mu2,
                     'mu_rate':  mu_rate,'progress': progress,
                     'date':     date_text, 'time':  time_text,
@@ -344,23 +348,6 @@ class TrackingWorker(QThread):
         except ValueError:
             return None
 
-    def _validate_plan(self, text):
-        n = self._to_float(text)
-        if n is None:
-            return None
-        if 10000 <= n <= 40000:
-            return n
-        if n > 1000000:
-            s = str(int(n))
-            if len(s) >= 7:
-                try:
-                    c = float(s[:2] + s[2:5] + '.' + s[5:7])
-                    if 10000 <= c <= 40000:
-                        return c
-                except Exception:
-                    pass
-        return None
-
     def _validate_mu(self, text):
         n = self._to_float(text)
         if n is None:
@@ -406,11 +393,10 @@ class TrackingWorker(QThread):
                 return candidate
         return None
 
-    def _validate_progress(self, text, plan1, plan2):
+    def _validate_progress(self, text):
         """Returns (value, loop_complete)."""
-        # loop reset: progress was ≥99% and plan fields disappeared
-        if (plan1 is None and plan2 is None
-                and self._last_progress is not None
+        # loop reset: progress was ≥99% last frame
+        if (self._last_progress is not None
                 and self._last_progress >= 99):
             self._last_progress = 0
             self._last_mu1 = None
