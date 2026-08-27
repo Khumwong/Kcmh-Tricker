@@ -2059,6 +2059,11 @@ class RunWidget(QWidget):
         if self._window._qa_mode:
             print(f"  qa_pos  X={self._qa_pos_x_edit.text()} Y={self._qa_pos_y_edit.text()} R={self._qa_pos_r_edit.text()}")
             print(f"  qa_spd  X={self._vel_x_edit.text()} Y={self._vel_y_edit.text()} R={self._vel_r_edit.text()}")
+            # phantom position at launch = sweep start (set by _load_run's blocking move)
+            self._qa_start_pos = (self._ph_x_label.text(), self._ph_y_label.text(),
+                                  self._ph_r_label.text())
+        else:
+            self._qa_start_pos = None
         self._launch_time = time.monotonic()
         self._gating_log = []
         # NOT stamped here — FPGA doesn't gate the beam (\xFE) until Start Acquisition.
@@ -2112,6 +2117,9 @@ class RunWidget(QWidget):
     def stop_run(self):
         self._run_active = False
         self._run_stop_epoch = time.time()
+        if self._window._qa_mode:
+            # clear so we can detect the fresh end-of-sweep poll from _vel_stop_run
+            self._phantom_panel._pos_poll_result = None
         self._vel_stop_run()  # หยุด stage ทันทีก่อนทำ log building / eudaq.stop
         _acq_t = getattr(self, '_acq_start_time', None)
         _acq_elapsed = f"{time.monotonic() - _acq_t:.2f}s" if _acq_t else "?"
@@ -2148,6 +2156,17 @@ class RunWidget(QWidget):
                 _toast_sub = "Auto-kill beam ใน 5 วินาที" if self._auto_kill_checkbox.isChecked() else "รอกด Kill beam"
             self._show_toast("Run complete ✓", _toast_sub)
         self._terminal_widget.terminate()  # close log only after EUDAQ has stopped
+
+        # QA sweep: wait for _vel_stop_run's background poll so the log records the
+        # real end-of-sweep position, not the stale start position
+        if self._window._qa_mode:
+            _deadline = time.monotonic() + 3.0
+            while (self._phantom_panel._pos_poll_result is None
+                   and time.monotonic() < _deadline):
+                QApplication.processEvents()
+                time.sleep(0.05)
+            if self._phantom_panel._pos_poll_result is not None:
+                self._on_pos_poll_slot()
 
         if self._pid is not None and self.get_new_outfile() != self._first_file:
             self._first_file = self.get_new_outfile()
@@ -2207,6 +2226,24 @@ class RunWidget(QWidget):
                     ("Current (nA)", _le.get("current", None)),
                 ]
                 def _fv(w): return w.text() if w is not None else "-"
+
+                # QA sweep block — records mode, sweep target/speed, and start->end
+                # position so a QA run can be correlated with stage position offline
+                _qa_block = ""
+                if self._window._qa_mode:
+                    _sp = getattr(self, '_qa_start_pos', None) or ("-", "-", "-")
+                    _qa_block = (
+                        f"\n--- QA Sweep ---\n"
+                        f"  Mode      : QA\n"
+                        f"  Start     : X={_sp[0]}  Y={_sp[1]}  R={_sp[2]}\n"
+                        f"  End       : X={self._ph_x_label.text()}  "
+                        f"Y={self._ph_y_label.text()}  R={self._ph_r_label.text()}\n"
+                        f"  Target    : X={_fv(self._qa_pos_x_edit)}  "
+                        f"Y={_fv(self._qa_pos_y_edit)}  R={_fv(self._qa_pos_r_edit)}\n"
+                        f"  Speed     : X={_fv(self._vel_x_edit)} mm/s  "
+                        f"Y={_fv(self._vel_y_edit)} mm/s  R={_fv(self._vel_r_edit)} deg/s\n"
+                    )
+
                 _program_log_content = (
                     f"=== Run Log ===\n"
                     f"  File      : {self._current_file.split('/')[-1] if self._current_file else '-'}\n"
@@ -2220,6 +2257,7 @@ class RunWidget(QWidget):
                     f"  X         : {self._ph_x_label.text()} mm\n"
                     f"  Y         : {self._ph_y_label.text()} mm\n"
                     f"  R         : {self._ph_r_label.text()} deg\n"
+                    + _qa_block +
                     f"\n--- Controller ---\n"
                     + "".join(f"  {k:<20}: {_fv(w)}\n" for k, w in _ctrl_fields) +
                     f"\n--- EUDAQ ---\n"
