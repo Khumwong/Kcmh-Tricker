@@ -317,6 +317,9 @@ class RunProgress(QObject):
         self._window.stop_run()
 
     def _on_step_started(self, duration_s):
+        # the per-loop "beam on" sound is a Treatment cue only — QA runs stay silent
+        if self._window._window._qa_mode:
+            return
         try:
             import modules.sound as _sound
             import os
