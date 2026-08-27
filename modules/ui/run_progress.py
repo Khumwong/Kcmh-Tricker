@@ -286,11 +286,6 @@ class RunProgress(QObject):
             self._ph_locs[0].setText("X: " + self._window._ph_x_label.text() + " mm")
             self._ph_locs[1].setText("Y: " + self._window._ph_y_label.text() + " mm")
             self._ph_locs[2].setText("R: " + self._window._ph_r_label.text() + " degree")
-            if value['type'] == 'step':
-                try:
-                    self._window.log_zaber_step(step, value['locs'][0], value['locs'][1], value['locs'][2])
-                except Exception:
-                    pass
     
     def progress_finish(self):
         global force_stop
@@ -411,13 +406,6 @@ class RunProgress(QObject):
             time_step = expose_time / self._num_step_loops
             time_prog_size = expose_time / 1000
         self._start_time = datetime.datetime.now()
-        try:
-            # Acquisition (FPGA trigger bytes -> real events) truly begins here, not at
-            # Launch — stamp run_start_epoch now so it lines up with step 0's own epoch.
-            self._window._run_start_epoch = time.time()
-            self._window.log_zaber_step(0, self._locs[0], self._locs[1], self._locs[2])
-        except Exception:
-            pass
         self._is_running = True
         self._stop_btn.setEnabled(True)
         try:
