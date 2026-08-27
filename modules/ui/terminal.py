@@ -77,55 +77,123 @@ def _ansi_to_html(raw: str) -> str:
     )
 
 
+_STATE_ABBR = {
+    'UNINITIALISED': 'UNINIT',
+    'UNCONFIGURED':  'UNCONF',
+    'CONFIGURED':    'CONFIG',
+    'RUNNING':       'RUN',
+    '--ERROR--':     'ERR',
+    'WAIT':          'WAIT',
+}
+
+
+def _abbr(s):
+    return _STATE_ABBR.get(s, s[:6])
+
+
+# euRun status-table rows: "│ALPIDE_plane_0   RUN   12345   7   Started│"
+# box-drawing delimiters are optional (some tmux captures drop them).
+_PROD_ROW_RE = _re.compile(
+    r'[│|]?\s*ALPIDE_plane_(\d+)\s+(\S+)\s+(\d+)\s+(\d+)[ \t]*([^\r\n│|]*)',
+    _re.MULTILINE,
+)
+_DC_ROW_RE = _re.compile(
+    r'[│|]?\s*dc\s+(\S+)\s+(\d+)\s+(\d+)[ \t]*([^\r\n│|]*)',
+    _re.MULTILINE,
+)
+_CURRENT_RUN_RE = _re.compile(r'Current run:\s+(\S+)\s+events\s+\(([^)]+)\)')
+_PLAIN_STATE_RE = _re.compile(r'ALPIDE_plane_\d+\s+(\S+)')
+
+
 def _format_its3_log(content: str) -> str:
-    """Convert raw ITS3 terminal snapshots into per-snapshot blocks with full producer detail."""
+    """Convert raw ITS3 terminal snapshots into per-snapshot blocks.
+
+    Preferred output is the full euRun producer table per snapshot (per-plane
+    Data EV# / Stat EV# / Message, incl. the DataCollector "Out of sync"
+    warnings). If a snapshot has no parseable table, fall back to a one-line
+    state summary for that snapshot.
+    """
     content = _NON_COLOR_ANSI.sub('', content)
     content = _COLOR_ANSI.sub('', content)
-
-    _STATE_ABBR = {
-        'UNINITIALISED': 'UNINIT',
-        'UNCONFIGURED':  'UNCONF',
-        'CONFIGURED':    'CONFIG',
-        'RUNNING':       'RUN',
-        '--ERROR--':     'ERR',
-        'WAIT':          'WAIT',
-    }
-
-    def _abbr(s):
-        return _STATE_ABBR.get(s, s[:6])
 
     _snap_re = _re.compile(r'\[(\d{2}:\d{2}:\d{2})\]\n')
     parts = _snap_re.split(content)
 
-    snapshots = []
+    _DETAIL_HDR = ('Plane', 'State', 'Data EV#', 'Stat EV#', 'Message')
+    lines = []
+    n_snap = 0
+    n_detailed = 0
     i = 1
     while i + 1 < len(parts):
-        ts   = parts[i]
+        ts   = parts[i].strip()
         body = parts[i + 1]
         i += 2
+        n_snap += 1
 
-        state_re = _re.compile(r'ALPIDE_plane_\d+\s+(\S+)')
-        states = state_re.findall(body)
-        summary = ' '.join(_abbr(s) for s in states) if states else '—'
+        producers = {}
+        for m in _PROD_ROW_RE.finditer(body):
+            producers[int(m.group(1))] = {
+                'state':   _abbr(m.group(2)),
+                'data_ev': m.group(3),
+                'stat_ev': m.group(4),
+                'message': m.group(5).strip(),
+            }
 
-        prod_re  = _re.compile(
-            r'(ALPIDE_plane_\d+)\s+(\S+)\s+\|\s+(\d+)\s+ev\s+\|\s+([\d.]+)\s+Hz'
-        )
-        prod_lines = []
-        for m in prod_re.finditer(body):
-            prod_lines.append(
-                f"    {m.group(1):<20} {m.group(2):<8} {m.group(3):>7} ev  {m.group(4):>8} Hz"
-            )
+        if not producers:
+            # fallback: one-line summary for this snapshot
+            states = _PLAIN_STATE_RE.findall(body)
+            summary = ' '.join(_abbr(s) for s in states) if states else '—'
+            lines.append(f"  {ts}  {summary}")
+            continue
 
-        block = [f"[{ts}]  {summary}"]
-        if prod_lines:
-            block.extend(prod_lines)
-        snapshots.append('\n'.join(block))
+        n_detailed += 1
+        dc_m = _DC_ROW_RE.search(body)
+        dc_info = {
+            'state':   _abbr(dc_m.group(1)) if dc_m else '-',
+            'data_ev': dc_m.group(2) if dc_m else '-',
+            'stat_ev': dc_m.group(3) if dc_m else '-',
+            'message': dc_m.group(4).strip() if dc_m else '',
+        }
 
-    lines = [f"ITS3 Log — {len(snapshots)} snapshots", "=" * 40]
-    lines.extend(snapshots)
-    lines.append(f"  Total: {len(snapshots)} snapshots")
-    return '\n'.join(lines) + '\n'
+        ev_m = _CURRENT_RUN_RE.search(body)
+        events = f"{ev_m.group(1)} ({ev_m.group(2)})" if ev_m else '-'
+
+        p_vals = {v['state'] for v in producers.values()}
+        dc_st  = dc_info['state']
+        if any('ERR' in v for v in p_vals) or dc_st == 'ERR':
+            overall = 'ERROR'
+        elif p_vals <= {'RUN'} and dc_st == 'RUN':
+            overall = 'RUNNING'
+        elif p_vals <= {'CONFIG', 'RUN'} and dc_st in ('CONFIG', 'RUN'):
+            overall = 'CONFIG'
+        elif p_vals <= {'UNINIT'} and dc_st in ('UNINIT', '-'):
+            overall = 'UNINIT'
+        elif p_vals <= {'UNCONF', 'UNINIT'}:
+            overall = 'UNCONF'
+        else:
+            overall = '/'.join(sorted(p_vals)) if p_vals else '-'
+
+        lines.append(f"  {ts}  {overall}  {events}")
+        rows = []
+        for n in range(6):
+            p = producers.get(n, {'state': '-', 'data_ev': '-', 'stat_ev': '-', 'message': ''})
+            rows.append((f'P{n}', p['state'], p['data_ev'], p['stat_ev'], p['message']))
+        rows.append(('dc', dc_info['state'], dc_info['data_ev'], dc_info['stat_ev'], dc_info['message']))
+
+        w = [max(len(_DETAIL_HDR[c]), max(len(r[c]) for r in rows)) for c in range(5)]
+        fmt = '    ' + '  '.join(f'{{:<{w[c]}}}' for c in range(5))
+        sep = '    ' + '  '.join('-' * w[c] for c in range(5))
+        lines.append(fmt.format(*_DETAIL_HDR))
+        lines.append(sep)
+        for r in rows:
+            lines.append(fmt.format(*r).rstrip())
+        lines.append('')
+
+    header = [
+        f"ITS3 Log — {n_snap} snapshots ({n_detailed} with producer detail)",
+        "=" * 40,
+    ]
+    return '\n'.join(header + lines + [f"  Total: {n_snap} snapshots"]) + '\n'
 
 
 # ── EmbeddedTerminal ──────────────────────────────────────────────────────────
