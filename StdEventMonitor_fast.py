@@ -132,6 +132,11 @@ def read_raw_collect_arrays(raw_file_path, n_planes_hint=N_PLANES_DEFAULT):
     n_events = 0
     n_bore = 0
     n_eore = 0
+    first_trigger = {}
+    first_data_event_id = None
+    sync_total_hits = {}
+    sync_active_planes = {}
+    reassigned_plane_events = 0
 
     with suppress_c_output(suppress_stdout=True, suppress_stderr=True):
         reader = pyeudaq.FileReader("native", raw_file_path)
@@ -153,6 +158,19 @@ def read_raw_collect_arrays(raw_file_path, n_planes_hint=N_PLANES_DEFAULT):
                 run_number = ev.GetRunN()
 
             event_id = int(ev.GetEventN())
+            if first_data_event_id is None:
+                first_data_event_id = event_id
+
+            # ITS3DataCollector groups events by queue position, not by trigger or
+            # timestamp.  Preserve each producer's metadata so a skipped frame in
+            # one producer does not permanently shift that plane in all later
+            # collector packets.
+            subevent_meta = {}
+            for subev in ev.GetSubEvents():
+                device_id = int(subev.GetDeviceN())
+                trigger = int(subev.GetTriggerN())
+                first_trigger.setdefault(device_id, trigger)
+                subevent_meta[device_id] = trigger
 
             stdev = pyeudaq.StandardEvent()
             pyeudaq.StdEventConverter.Convert(ev, stdev, None)
@@ -166,6 +184,13 @@ def read_raw_collect_arrays(raw_file_path, n_planes_hint=N_PLANES_DEFAULT):
                 plane_id = int(plane.ID())
                 nhits = int(plane.HitPixels())
 
+                plane_event_id = event_id
+                if plane_id in subevent_meta:
+                    trigger = subevent_meta[plane_id]
+                    plane_event_id = first_data_event_id + trigger - first_trigger[plane_id]
+                if plane_event_id != event_id:
+                    reassigned_plane_events += 1
+
                 if plane_id > max_plane_id:
                     max_plane_id = plane_id
 
@@ -177,8 +202,12 @@ def read_raw_collect_arrays(raw_file_path, n_planes_hint=N_PLANES_DEFAULT):
                     plane_y_chunks[plane_id] = []
 
                 plane_hit_sums[plane_id] += nhits
-                plane_event_ids[plane_id].append(event_id)
+                plane_event_ids[plane_id].append(plane_event_id)
                 plane_event_nhits[plane_id].append(nhits)
+
+                sync_total_hits[plane_event_id] = sync_total_hits.get(plane_event_id, 0) + nhits
+                if nhits > 0:
+                    sync_active_planes.setdefault(plane_event_id, set()).add(plane_id)
 
                 total_hits_this_event += nhits
 
@@ -199,9 +228,6 @@ def read_raw_collect_arrays(raw_file_path, n_planes_hint=N_PLANES_DEFAULT):
                     plane_x_chunks[plane_id].append(xvals)
                     plane_y_chunks[plane_id].append(yvals)
 
-            event_ids.append(event_id)
-            event_total_hits.append(total_hits_this_event)
-            event_nplanes.append(active_planes_this_event)
             n_events += 1
 
             if n_events % 10000 == 0:
@@ -214,9 +240,14 @@ def read_raw_collect_arrays(raw_file_path, n_planes_hint=N_PLANES_DEFAULT):
     if max_plane_id < 0:
         raise RuntimeError("No valid planes found.")
 
-    event_ids = np.asarray(event_ids, dtype=np.int64)
-    event_total_hits = np.asarray(event_total_hits, dtype=np.int64)
-    event_nplanes = np.asarray(event_nplanes, dtype=np.int64)
+    # Rebuild global per-event quantities after plane reassignment.
+    event_ids = np.asarray(sorted(sync_total_hits), dtype=np.int64)
+    event_total_hits = np.asarray(
+        [sync_total_hits[eid] for eid in event_ids], dtype=np.int64
+    )
+    event_nplanes = np.asarray(
+        [len(sync_active_planes.get(eid, ())) for eid in event_ids], dtype=np.int64
+    )
 
     plane_xy = {}
     for plane_id in range(max_plane_id + 1):
@@ -246,6 +277,7 @@ def read_raw_collect_arrays(raw_file_path, n_planes_hint=N_PLANES_DEFAULT):
         "plane_event_ids": plane_event_ids,
         "plane_event_nhits": plane_event_nhits,
         "plane_xy": plane_xy,
+        "reassigned_plane_events": reassigned_plane_events,
     }
 
 
@@ -365,6 +397,7 @@ def build_histograms_parallel(collected, n_workers=None):
             pid: collected["plane_hit_sums"].get(pid, 0)
             for pid in range(max_plane_id + 1)
         },
+        "reassigned_plane_events": collected["reassigned_plane_events"],
     }
 
     return monitor_histograms, plane_monitor_histograms, alpide_histograms, summary
@@ -443,6 +476,8 @@ def main():
     print(f"Max plane ID      : {summary['max_plane_id']}")
     print(f"Max hits / event  : {summary['max_hits_event']}")
     print(f"Max active planes : {summary['max_nplanes']}")
+    print("Synchronization   : trigger")
+    print(f"Plane entries moved: {summary['reassigned_plane_events']}")
 
     print("\nTotal hits per plane")
     for plane_id in range(summary["max_plane_id"] + 1):
