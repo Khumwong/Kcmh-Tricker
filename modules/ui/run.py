@@ -1328,20 +1328,28 @@ class RunWidget(QWidget):
         _mode = row_data.get("mode", "treatment").strip().lower()
         self._set_qa_mode(_mode == "qa")
 
-        # populate all form fields
+        # populate all form fields — a blank cell RESETS optional fields to their
+        # default so a row never silently inherits the previous row's step/sweep
+        _blank_default = {
+            "X step (mm)": "0", "Y step (mm)": "0", "R step (degree)": "0",
+        }
         for key in self._line_edits:
             if key in row_data and row_data[key] != "":
                 self._line_edits[key].setText(row_data[key])
+            elif key in _blank_default:
+                self._line_edits[key].setText(_blank_default[key])
 
-        # populate QA fields (position + speed)
-        for edit, key in [(self._qa_pos_x_edit, "qa_pos_x"),
-                          (self._qa_pos_y_edit, "qa_pos_y"),
-                          (self._qa_pos_r_edit, "qa_pos_r"),
-                          (self._vel_x_edit,    "vel_x"),
-                          (self._vel_y_edit,    "vel_y"),
-                          (self._vel_r_edit,    "vel_r")]:
+        # populate QA fields (position + speed) — blank cell resets: pos -> "", speed -> "0"
+        for edit, key, _blank in [(self._qa_pos_x_edit, "qa_pos_x", ""),
+                                  (self._qa_pos_y_edit, "qa_pos_y", ""),
+                                  (self._qa_pos_r_edit, "qa_pos_r", ""),
+                                  (self._vel_x_edit,    "vel_x",    "0"),
+                                  (self._vel_y_edit,    "vel_y",    "0"),
+                                  (self._vel_r_edit,    "vel_r",    "0")]:
             if key in row_data and row_data[key] != "":
                 edit.setText(row_data[key])
+            else:
+                edit.setText(_blank)
 
         # set phantom go-to inputs
         sx = row_data.get("start_x", "0")
