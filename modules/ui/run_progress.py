@@ -428,6 +428,13 @@ class RunProgress(QObject):
         if _qa_sweep:
             time_step = 86400.0
             time_prog_size = 86400.0
+        elif _qa:
+            # QA static: one continuous acquisition window of (exp+delay)*Loops,
+            # not Loops chopped windows — no pointless gate toggling / sound retrigger
+            self._num_step_loops = 1
+            self._progress_bar.setFormat("0/1")
+            time_step = expose_time
+            time_prog_size = expose_time
         else:
             time_step = expose_time / self._num_step_loops
             time_prog_size = expose_time / 1000
