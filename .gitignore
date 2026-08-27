@@ -8,7 +8,6 @@ plan/
 video/
 !output/sim/
 !output/sim/sample.raw
-logs.txt
 run0.root
 # machine-specific config
 config.json

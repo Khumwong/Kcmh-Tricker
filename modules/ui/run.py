@@ -2152,8 +2152,6 @@ class RunWidget(QWidget):
         if self._pid is not None and self.get_new_outfile() != self._first_file:
             self._first_file = self.get_new_outfile()
             self._current_file = self._first_file
-            with open("./logs.txt", "a") as f:
-                f.write(f"{self._current_file},{','.join([v.text() for v in self._line_edits.values()])}\n")
             # build program log
             _program_log_content = ""
             if self._run_stats_start is not None:
