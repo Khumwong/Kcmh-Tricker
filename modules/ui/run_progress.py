@@ -411,30 +411,16 @@ class RunProgress(QObject):
         expose_time = (float(self._window._line_edits["Exposure time (ms)"].text()) +
                        float(self._window._line_edits["Beam delay (ms)"].text())
                        ) * int(self._window._line_edits["Loops"].text()) * 1e-3
-        _qa = self._window._window._qa_mode
-        # QA with an actual velocity sweep: run until the stage reaches the target
-        # (force_stop set by _vel_start_run). QA static / Treatment: time-based stop.
-        def _fnum(w):
-            try:
-                return float(w.text() or 0)
-            except (ValueError, AttributeError):
-                return 0.0
-        _qa_sweep = _qa and any(
-            _fnum(vw) > 0 and pw.text().strip() != ""
-            for vw, pw in ((self._window._vel_x_edit, self._window._qa_pos_x_edit),
-                           (self._window._vel_y_edit, self._window._qa_pos_y_edit),
-                           (self._window._vel_r_edit, self._window._qa_pos_r_edit))
-        )
-        if _qa_sweep:
+        # QA mode: one continuous acquisition window (never chopped into Loops
+        # sub-windows, so the beam gate opens once and the step sound plays once).
+        #   - velocity sweep -> ends when the stage reaches target (force_stop
+        #     from _vel_start_run)
+        #   - static (no sweep) -> ends only when the operator presses Stop
+        # Treatment: time-based auto-stop after (exposure+delay)*Loops.
+        if self._window._window._qa_mode:
             time_step = 86400.0
             time_prog_size = 86400.0
-        elif _qa:
-            # QA static: one continuous acquisition window of (exp+delay)*Loops,
-            # not Loops chopped windows — no pointless gate toggling / sound retrigger
-            self._num_step_loops = 1
-            self._progress_bar.setFormat("0/1")
-            time_step = expose_time
-            time_prog_size = expose_time
+            self._progress_bar.setFormat("QA acquiring…")
         else:
             time_step = expose_time / self._num_step_loops
             time_prog_size = expose_time / 1000
