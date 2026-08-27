@@ -11,6 +11,10 @@
 
 เปิด: `python3 main.py --sim`  (มี Control Room window เด้งมาด้วย)
 
+> UI-logic ส่วนใหญ่ของ A cover ด้วย `QT_QPA_PLATFORM=offscreen python3 -u tests/test_ui_flows.py`
+> (mode switching, speed-limit guard, plan โหลดทั้ง 2 schema, dialogs, config round-trip,
+> `_format_its3_log`). ที่เหลือใน A ต้องคลิกเองเพราะเกี่ยวกับ EUDAQ/tmux/motion.
+
 ### A0. เปิดแอป
 - [ ] แอปเปิด ไม่มี traceback ใน terminal
 - [ ] Header: ALPIDE / Zaber / FPGA ขึ้นสถานะ (เขียวใน sim)
