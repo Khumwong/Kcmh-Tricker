@@ -83,12 +83,21 @@ class ProgressWorker(QRunnable):
                         except Exception:
                             time.sleep(0.5)
 
+            def log_gate(state):
+                try:
+                    w = self.kwargs.get('window')
+                    if w is not None:
+                        w.log_gate_event(state, locs[0], locs[1], locs[2])
+                except Exception:
+                    pass
+
             step_current_datetime = datetime.datetime.now()
             value = 0
             step = 1
-            ser_write(b'\xFE')
-            self.signals.step_started.emit(self.args[1])
             locs = self.kwargs['locs']
+            ser_write(b'\xFE')
+            log_gate("OPEN")
+            self.signals.step_started.emit(self.args[1])
             while True:
                 time.sleep(0.05)
                 _has_conn = self.kwargs['conn'] is not None
@@ -104,11 +113,13 @@ class ProgressWorker(QRunnable):
                         _sig['locs'] = locs
                     self.signals.progress.emit(_sig)
                     ser_write(b'\xEF')
+                    log_gate("CLOSE")
                     break
 
                 elapsed = (datetime.datetime.now() - step_current_datetime).total_seconds()
                 if elapsed > self.args[1]:
                     ser_write(b'\xEF')
+                    log_gate("CLOSE")
                     if _has_conn:
                         _vels = self.kwargs.get('velocities')
                         if _vels:
@@ -124,6 +135,7 @@ class ProgressWorker(QRunnable):
                     if step > self.args[2]:
                         break
                     ser_write(b'\xFE')
+                    log_gate("OPEN")
                     self.signals.step_started.emit(self.args[1])
                 else:
                     new_val = int(((step - 1) + elapsed / self.args[1]) / self.args[2] * 1000)
@@ -406,6 +418,9 @@ class RunProgress(QObject):
             time_step = expose_time / self._num_step_loops
             time_prog_size = expose_time / 1000
         self._start_time = datetime.datetime.now()
+        # FPGA gate (\xFE) fires for real starting here, not at Launch — anchor
+        # the gating log's clock to this moment.
+        self._window._run_start_epoch = time.time()
         self._is_running = True
         self._stop_btn.setEnabled(True)
         try:

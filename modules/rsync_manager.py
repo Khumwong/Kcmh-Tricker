@@ -46,15 +46,15 @@ class RsyncManager(QObject):
         ).start()
 
     def upload(self, filepath: str, dest: str, log_content: str, fname_short: str,
-               addr: str, rpath: str):
-        """rsync file to dest, then upload log + run ROOT conversion.
+               addr: str, rpath: str, gating_csv_content: str = None):
+        """rsync file to dest, then upload log + gating CSV + run ROOT conversion.
 
         Emits proc_created(proc) on the GUI thread shortly after rsync starts,
         so callers can attach the proc to RsyncToast for cancel support.
         """
         threading.Thread(
             target=self._do_rsync,
-            args=(filepath, dest, log_content, fname_short, addr, rpath, self._password),
+            args=(filepath, dest, log_content, fname_short, addr, rpath, self._password, gating_csv_content),
             daemon=True
         ).start()
 
@@ -64,7 +64,7 @@ class RsyncManager(QObject):
         import os as _os
         _test_timeout = ['-o', 'ConnectTimeout=3']
         mkdir_cmd = (
-            f'mkdir -p "{rpath}/raw" "{rpath}/root" "{rpath}/scripts" "{rpath}/log"'
+            f'mkdir -p "{rpath}/raw" "{rpath}/root" "{rpath}/scripts" "{rpath}/log" "{rpath}/gating"'
         )
         if password:
             result = subprocess.run(
@@ -90,6 +90,7 @@ class RsyncManager(QObject):
         scripts = [
             _os.path.join(_proj_root, 'StdEventMonitor_fast.py'),
             _os.path.join(_proj_root, 'run_with_stats.py'),
+            _os.path.join(_proj_root, 'check_gating_consistency.py'),
         ]
         script_dest = f"{addr}:{rpath}/scripts/"
         if password:
@@ -126,7 +127,7 @@ class RsyncManager(QObject):
         proc.wait()
         return proc.returncode, proc.stderr.read()
 
-    def _do_rsync(self, filepath, dest, log_content, fname_short, addr, rpath, password):
+    def _do_rsync(self, filepath, dest, log_content, fname_short, addr, rpath, password, gating_csv_content=None):
         import time as _time
         t0 = _time.monotonic()
         if password:
@@ -155,7 +156,7 @@ class RsyncManager(QObject):
             self.done.emit("ok", ok_detail)
             threading.Thread(
                 target=self._upload_log_and_monitor,
-                args=(fname_short, log_content, addr, rpath, password),
+                args=(fname_short, log_content, addr, rpath, password, gating_csv_content),
                 daemon=True
             ).start()
         else:
@@ -172,12 +173,13 @@ class RsyncManager(QObject):
             self.status_changed.emit("rsync fail", "#ef5350")
             self.done.emit("error", detail)
 
-    def _upload_log_and_monitor(self, fname, log_content, addr, rpath, password):
+    def _upload_log_and_monitor(self, fname, log_content, addr, rpath, password, gating_csv_content=None):
         import os as _os, tempfile as _tempfile
         fname_base     = _os.path.splitext(fname)[0]
         remote_log     = f"{rpath}/log/{fname_base}.log"
         remote_raw     = f"{rpath}/raw/{fname}"
         remote_root    = f"{rpath}/root/{fname_base}.root"
+        remote_gating  = f"{rpath}/gating/{fname_base}_gating.csv"
         remote_wrapper = f"{rpath}/scripts/run_with_stats.py"
 
         # step 1: rsync program log
@@ -204,6 +206,32 @@ class RsyncManager(QObject):
             print(f"[log] done → {remote_log}")
         else:
             print(f"[log] ERROR: {r.stderr.decode(errors='replace').strip()}")
+
+        # step 1b: rsync FPGA-gating position CSV (\\xFE/\\xEF timestamps + Zaber position)
+        if gating_csv_content:
+            with _tempfile.NamedTemporaryFile(
+                mode='w', suffix='.csv', delete=False, encoding='utf-8'
+            ) as gf:
+                gf.write(gating_csv_content)
+                gating_tmp_path = gf.name
+            gating_dest = f"{addr}:{remote_gating}"
+            if password:
+                gr = subprocess.run(
+                    ['sshpass', '-p', password, 'rsync', '-az',
+                     '-e', 'ssh ' + ' '.join(_PWD_SSH_OPTS),
+                     gating_tmp_path, gating_dest],
+                    stdout=subprocess.DEVNULL, stderr=subprocess.PIPE
+                )
+            else:
+                gr = subprocess.run(
+                    ['rsync', '-az', gating_tmp_path, gating_dest],
+                    stdout=subprocess.DEVNULL, stderr=subprocess.PIPE
+                )
+            _os.unlink(gating_tmp_path)
+            if gr.returncode == 0:
+                print(f"[gating] done → {remote_gating}")
+            else:
+                print(f"[gating] ERROR: {gr.stderr.decode(errors='replace').strip()}")
 
         # step 2: SSH run_with_stats
         cmd = (

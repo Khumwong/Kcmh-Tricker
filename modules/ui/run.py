@@ -63,6 +63,9 @@ class RunWidget(QWidget):
         self._run_stats_start = None
         self._qa_launch_time = None
         self._zaber_max_speeds = None
+        self._gating_log = []
+        self._run_start_epoch = None
+        self._run_stop_epoch = None
         self._checks = [0, 0]
         self._beam_ctrl = BeamController(parent=self)
         self._beam_ctrl._auto_kill_timer.timeout.connect(self._tick_auto_kill)
@@ -2054,6 +2057,10 @@ class RunWidget(QWidget):
             print(f"  qa_pos  X={self._qa_pos_x_edit.text()} Y={self._qa_pos_y_edit.text()} R={self._qa_pos_r_edit.text()}")
             print(f"  qa_spd  X={self._vel_x_edit.text()} Y={self._vel_y_edit.text()} R={self._vel_r_edit.text()}")
         self._launch_time = time.monotonic()
+        self._gating_log = []
+        # NOT stamped here — FPGA doesn't gate the beam (\xFE) until Start Acquisition.
+        self._run_start_epoch = None
+        self._run_stop_epoch = None
         self._pid = eudaq.default_run(self._line_edits, self._outpath_label.text())
         psutil.cpu_percent(interval=None)  # warm-up
         self._run_stats_start = {
@@ -2101,6 +2108,7 @@ class RunWidget(QWidget):
         
     def stop_run(self):
         self._run_active = False
+        self._run_stop_epoch = time.time()
         self._vel_stop_run()  # หยุด stage ทันทีก่อนทำ log building / eudaq.stop
         _acq_t = getattr(self, '_acq_start_time', None)
         _acq_elapsed = f"{time.monotonic() - _acq_t:.2f}s" if _acq_t else "?"
@@ -2261,6 +2269,7 @@ class RunWidget(QWidget):
                 self._rsync_mgr.upload(
                     self._current_file, rsync_dest, _program_log_content,
                     fname_short, rsync_addr, rsync_rpath,
+                    gating_csv_content=self._build_gating_csv_content(),
                 )
                 rsync_note = f"rsync → {rsync_addr} (sending...)"
             else:
@@ -2307,6 +2316,30 @@ class RunWidget(QWidget):
                 _sim.control_room.reset()
         except Exception:
             pass
+
+    def log_gate_event(self, state, x, y, r):
+        """เก็บจังหวะที่ FPGA gate เปิด/ปิดจริง (\\xFE/\\xEF) พร้อมตำแหน่ง Zaber ณ ตอนนั้น
+        — ไว้เช็คว่าบีมเข้า sensor ระหว่าง Zaber กำลังขยับหรือเปล่า"""
+        self._gating_log.append((time.time(), state, x, y, r))
+
+    def _build_gating_csv_content(self):
+        try:
+            trigger_freq_hz = self._line_edits["Trigger Freq. (Hz)"].text().strip()
+        except Exception:
+            trigger_freq_hz = ""
+        lines = [
+            f"# run_start_epoch={self._run_start_epoch or 0.0}",
+            f"# run_stop_epoch={self._run_stop_epoch or 0.0}",
+            f"# trigger_freq_hz={trigger_freq_hz}",
+            "epoch,datetime,step_index,gate_state,x_mm,y_mm,r_mm",
+        ]
+        step_index = 0
+        for epoch, state, x, y, r in self._gating_log:
+            if state == "OPEN":
+                step_index += 1
+            readable = datetime.fromtimestamp(epoch).strftime('%Y-%m-%d %H:%M:%S.%f')
+            lines.append(f"{epoch},{readable},{step_index},{state},{x:.4f},{y:.4f},{r:.4f}")
+        return "\n".join(lines) + "\n"
 
     def get_new_outfile(self):
         try:
