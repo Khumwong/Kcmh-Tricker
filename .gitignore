@@ -4,10 +4,11 @@ __pycache__/
 
 # output data
 output/
-plan/
+plan/*
 video/
 !output/sim/
 !output/sim/sample.raw
+!plan/plan_format_example.csv
 run0.root
 # machine-specific config
 config.json
