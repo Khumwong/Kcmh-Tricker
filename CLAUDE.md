@@ -103,18 +103,21 @@ Loaded and saved by `RunWidget`. Stores: output path, rsync address/path, all ru
 - `modules/ui/firmware_toast.py` (`FirmwareToast`): modal indeterminate progress dialog during ALPIDE firmware flash. Has a **Cancel button, Esc handler, and hard timeout** (`eudaq.FIRMWARE_TIMEOUT_S`, default 180 s) — all three route through `_FirmwareWorker.cancel()`, which `terminate()`s then `kill()`s `alpide-daq-program`. This exists because if the DAQ boards fail to re-enumerate after the FX3 load, `alpide-daq-program` blocks forever in `select()` on its udev monitor; without a timeout that froze the whole app at startup (`install_firmware_auto()` is called from `init_connect_devices()`, before `app.exec_()`). On timeout a `QMessageBox` tells the user to power-cycle the USB hub and DAQ boards and verify with `lsusb | grep -E "04b4|1556"`. Never remove the post-`exec()` `worker.cancel()` — it's the backstop against leaving an orphan process holding the udev socket.
 - `modules/ui/rsync_toast.py` (`RsyncToast`): non-modal progress dialog with % and speed during rsync; updated via `QMetaObject.invokeMethod` from a background thread
 
-## Automated UI Test
+## Tests
+
+One standalone script per refactor phase in `tests/` (run directly, not via pytest — each `sys.exit()`s):
 
 ```bash
-python3 -u test_ui.py --sim 2>/dev/null
+python3 -u tests/test_phase0_auxiliary.py     # class extraction
+python3 -u tests/test_phase1_config.py        # RunConfig / config.json
+python3 -u tests/test_phase2_notification.py  # NotificationPanel
+python3 -u tests/test_phase3_rsync.py         # RsyncManager
+python3 -u tests/test_phase4_plan.py          # PlanManager
+python3 -u tests/test_phase5_phantom.py --sim # PhantomPanel (needs Zaber)
+python3 -u tests/test_phase6_beam.py          # BeamController (needs FPGA)
 ```
 
-`test_ui.py` (~467 lines) runs a headless PyQt5 automated test of the full UI in `--sim` mode with a real Zaber connected via Control Room. Covers: app launch, connection status, QA run flow (Launch → Start Acquisition → Stop → QA Complete dialog), velocity test dialog, speed limit warning, Treatment mode CR sequence (PREPARE / READY / BEAM ON), and footer idle state. Outputs `PASS` / `FAIL` / `SKIP` lines. Must be run with `-u` (unbuffered) so results appear immediately when redirected to a file.
-
-**Key patterns used:**
-- Schedule dialog-close timers **before** the action that triggers the dialog (Qt nested event loops mean timers fired before `exec_()` will fire inside it)
-- Use `w.accept()` to close a `QDialog` programmatically (not `QTest.keyClick` — only works if dialog has a default button)
-- 3 SKIPs are expected in Treatment mode (no real FPGA in test environment)
+Phases 0-4 need no hardware and print `PASS` / `FAIL` lines. See `tests/README.md`.
 
 ## Critical Hardware Rule
 

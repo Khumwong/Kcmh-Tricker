@@ -13,12 +13,10 @@ run0.root
 # machine-specific config
 config.json
 
-# old/unused files
-structure.txt
-folder_structure.py
-launch_pyqt_app.sh
+# build / run artifacts
 *.g4bl
 rc.log
+.pytest_cache/
 # venv
 .venv/
 
@@ -26,6 +24,6 @@ rc.log
 .vscode/
 .idea/
 
-# testsanta
+# scratch
 testsanta
 server_inspect/
