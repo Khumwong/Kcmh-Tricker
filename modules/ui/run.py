@@ -2249,9 +2249,9 @@ class RunWidget(QWidget):
                     self._terminal_widget.log_path = None
             except Exception:
                 pass
-            # Save log locally to logs/ directory (always, regardless of rsync)
+            # Save log locally to <outpath>/log/ (always, regardless of rsync) — mirrors server layout
             try:
-                _local_log_dir = os.path.join(os.path.dirname(self._outpath_label.text()), 'logs')
+                _local_log_dir = os.path.join(self._outpath_label.text(), 'log')
                 os.makedirs(_local_log_dir, exist_ok=True)
                 _raw_base = os.path.splitext(os.path.basename(self._current_file))[0] if self._current_file else 'run_unknown'
                 _local_log_path = os.path.join(_local_log_dir, f"{_raw_base}.log")

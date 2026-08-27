@@ -88,7 +88,7 @@ The largest module (~4100+ lines). Contains:
 - `modules/zaber/connect.py`: wraps `zaber_motion.ascii.Connection.open_serial_port()`
 - `modules/zaber/motion.py`: all Zaber moves use `asyncio.gather` for parallel X/Y/R movement. Limits: X ≤ 150 mm, Y ≤ 40 mm, R ≤ 360°.
 - `modules/alpide.py`: detects ALPIDE DAQs by USB VID/PID. Three states: raw (unprogrammed, VID `0x04B4` PID `0x00F3`), programmed (VID `0x1556` PID `0x01B8`), or absent. Six specific DAQ serial numbers are hardcoded.
-- `modules/eudaq.py`: generates EUDAQ2 `.ini`/`.conf` files in `/home/santa/eudaq2/user/ITS3/misc/`, then launches `ITS3start_auto_gen.sh` via `subprocess.Popen`. EUDAQ dir and ALPIDE serial numbers are hardcoded constants. Raw files are written to `<outpath>/raw/` (created by `gen_its3_conf`) to mirror the remote server layout; `get_new_outfile()` in `run.py` scans that subdir. Recorded MU videos go to `<outpath>/video/` (`video_window.py` `_start_recording`), matching the server's `video/` folder.
+- `modules/eudaq.py`: generates EUDAQ2 `.ini`/`.conf` files in `/home/santa/eudaq2/user/ITS3/misc/`, then launches `ITS3start_auto_gen.sh` via `subprocess.Popen`. EUDAQ dir and ALPIDE serial numbers are hardcoded constants. Raw files are written to `<outpath>/raw/` (created by `gen_its3_conf`) to mirror the remote server layout; `get_new_outfile()` in `run.py` scans that subdir. Recorded MU videos go to `<outpath>/video/` (`video_window.py` `_start_recording`) and the local copy of each run log to `<outpath>/log/` — all mirroring the server's `raw/ video/ log/` layout.
 
 ### Simulation Mode (`modules/sim.py`)
 - `apply_sim()` monkey-patches every hardware module at runtime (serial port detection, FPGA, Zaber, ALPIDE, EUDAQ)
