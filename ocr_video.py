@@ -1,7 +1,19 @@
 #!/usr/bin/env python3
 """
 ocr_video.py — รันบน physics server (GPU)
-Usage: python3 ocr_video.py <mu_video_*.mp4> [--max-frames N]
+
+วางไว้ที่ <remote_path>/scripts/ocr_video.py (ข้างๆ run_with_stats.py) แล้ว
+เรียกแบบไม่ใส่ argument จะ OCR วิดีโอ *ทุกไฟล์* ใน <remote_path>/video/ ให้เอง
+(ข้ามไฟล์ที่มี _ocr.csv อยู่แล้ว เว้นแต่ใส่ --force):
+
+    python3 ocr_video.py                    # OCR ทุกวิดีโอที่ยังไม่เคยทำใน ../video/
+    python3 ocr_video.py --force            # OCR ทุกวิดีโอซ้ำ แม้เคยทำแล้ว
+
+หรือระบุไฟล์เดียวก็ได้เหมือนเดิม:
+
+    python3 ocr_video.py <mu_video_*.mp4> [--max-frames N]
+    python3 ocr_video.py <mu_video_*.mp4> --save-frames N   # dump ภาพ ROI ดิบดูด้วยตา
+
 Output: CSV + PNG ชื่อเดียวกับ video ใน directory เดียวกัน
 
 ROI order in video (top→bottom):
@@ -9,7 +21,7 @@ ROI order in video (top→bottom):
   1: mu_rate_roi
   2: progress_roi
 """
-import sys, os, re, csv, warnings
+import sys, os, re, csv, glob, warnings
 from datetime import datetime, timedelta
 import cv2
 
@@ -135,8 +147,7 @@ def _make_plot(rows, out_png):
 
 # ── main ──────────────────────────────────────────────────────────────────────
 
-def process(video_path, max_frames=None):
-    print('[ocr_video] loading EasyOCR…')
+def _build_reader():
     import PIL.Image
     if not hasattr(PIL.Image, 'Resampling'):
         PIL.Image.Resampling = PIL.Image
@@ -145,7 +156,13 @@ def process(video_path, max_frames=None):
     print(f'[ocr_video] GPU={gpu} ({torch.cuda.get_device_name(0) if gpu else "none"})')
     with warnings.catch_warnings():
         warnings.simplefilter('ignore')
-        reader = easyocr.Reader(['en'], gpu=gpu)
+        return easyocr.Reader(['en'], gpu=gpu)
+
+
+def process(video_path, max_frames=None, reader=None):
+    if reader is None:
+        print('[ocr_video] loading EasyOCR…')
+        reader = _build_reader()
 
     cap = cv2.VideoCapture(video_path)
     if not cap.isOpened():
@@ -257,17 +274,74 @@ def save_sample_frames(video_path, n_frames=100):
     print(f'[ocr_video] saved {saved} frames × {len(ROI_NAMES)} ROIs → {out_dir}/<roi_name>/')
 
 
+# ── process_all — batch mode: OCR ทุกวิดีโอใน <remote_path>/video/ ─────────────
+
+def process_all(video_dir=None, force=False):
+    """ไม่ระบุ video_dir → ใช้ ../video/ เทียบจากตำแหน่งสคริปต์เอง
+    (สมมติว่าสคริปต์วางอยู่ที่ <remote_path>/scripts/ocr_video.py)"""
+    if video_dir is None:
+        video_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), '..', 'video')
+    video_dir = os.path.abspath(video_dir)
+
+    if not os.path.isdir(video_dir):
+        print(f'[ocr_video] ERROR: video dir not found: {video_dir}')
+        return
+
+    videos = sorted(glob.glob(os.path.join(video_dir, '*.mp4')))
+    if not videos:
+        print(f'[ocr_video] no .mp4 files found in {video_dir}')
+        return
+
+    todo = []
+    for vp in videos:
+        out_csv = os.path.splitext(vp)[0] + '_ocr.csv'
+        if not force and os.path.exists(out_csv):
+            print(f'[ocr_video] skip (already done): {os.path.basename(vp)}')
+            continue
+        todo.append(vp)
+
+    if not todo:
+        print(f'[ocr_video] nothing to do — all {len(videos)} video(s) already processed'
+              f' (use --force to redo)')
+        return
+
+    print(f'[ocr_video] {len(todo)}/{len(videos)} video(s) to process in {video_dir}')
+    print('[ocr_video] loading EasyOCR…')
+    reader = _build_reader()
+
+    for i, vp in enumerate(todo, 1):
+        print(f'[ocr_video] === ({i}/{len(todo)}) {os.path.basename(vp)} ===')
+        try:
+            process(vp, reader=reader)
+        except Exception as e:
+            print(f'[ocr_video] FAILED on {os.path.basename(vp)}: {e}')
+
+
 if __name__ == '__main__':
-    if len(sys.argv) < 2:
-        print('Usage: python3 ocr_video.py <mu_video_*.mp4> [--max-frames N] [--save-frames N]')
-        sys.exit(1)
-    if '--save-frames' in sys.argv:
-        idx = sys.argv.index('--save-frames')
-        n = int(sys.argv[idx + 1])
-        save_sample_frames(sys.argv[1], n_frames=n)
+    args = sys.argv[1:]
+    _VALUE_FLAGS = ('--max-frames', '--save-frames')
+
+    positional = []
+    skip_next = False
+    for a in args:
+        if skip_next:
+            skip_next = False
+            continue
+        if a in _VALUE_FLAGS:
+            skip_next = True
+            continue
+        if not a.startswith('--'):
+            positional.append(a)
+
+    def _flag_value(name):
+        if name in args:
+            return int(args[args.index(name) + 1])
+        return None
+
+    # ไม่มี path วิดีโอระบุ → batch mode ทุกไฟล์ใน ../video/
+    if not positional:
+        process_all(force='--force' in args)
+    elif '--save-frames' in args:
+        save_sample_frames(positional[0], n_frames=_flag_value('--save-frames'))
     else:
-        max_f = None
-        if '--max-frames' in sys.argv:
-            idx = sys.argv.index('--max-frames')
-            max_f = int(sys.argv[idx + 1])
-        process(sys.argv[1], max_frames=max_f)
+        process(positional[0], max_frames=_flag_value('--max-frames'))

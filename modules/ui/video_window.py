@@ -4,7 +4,6 @@ import json
 import cv2
 import subprocess
 import numpy as np
-from queue import Queue, Empty
 from datetime import datetime
 
 from PyQt5.QtWidgets import (
@@ -147,332 +146,6 @@ class CameraThread(QThread):
         self.wait(2000)
 
 
-# ── TrackingWorker ────────────────────────────────────────────────────────────
-
-class TrackingWorker(QThread):
-    log          = pyqtSignal(str)
-    data_point   = pyqtSignal(dict)
-    loop_complete = pyqtSignal()
-    finished     = pyqtSignal(str)     # emits csv path
-
-    def __init__(self, roi_dir, output_csv, rotate):
-        super().__init__()
-        self.roi_dir     = roi_dir
-        self.output_csv  = output_csv
-        self.rotate      = rotate
-        self._running    = True
-        self._queue      = Queue(maxsize=2)
-        self.data_log    = []
-        self._last_mu1   = None
-        self._last_mu2   = None
-        self._pending_mu1 = None   # ค่าที่กระโดดขึ้นแต่ยังไม่ยืนยัน (รอเฟรมถัดไป >= ค่านี้)
-        self._pending_mu2 = None
-        self._last_progress = None
-        self._frame_count   = 0
-
-    def feed_frame(self, frame):
-        if not self._queue.full():
-            self._queue.put_nowait(frame)
-
-    def stop(self):
-        self._running = False
-
-    def run(self):
-        self.log.emit('Initializing EasyOCR…')
-        try:
-            import warnings, PIL.Image
-            if not hasattr(PIL.Image, 'Resampling'):
-                PIL.Image.Resampling = PIL.Image  # Pillow <9.1 compat
-            import easyocr
-            try:
-                import torch
-                gpu = torch.cuda.is_available()
-            except Exception:
-                gpu = False
-            with warnings.catch_warnings():
-                warnings.simplefilter('ignore')
-                reader = easyocr.Reader(['en'], gpu=gpu)
-            # suppress PyTorch pin_memory warning throughout inference
-            warnings.filterwarnings(
-                'ignore', message='.*pin_memory.*', category=UserWarning)
-        except Exception as e:
-            self.log.emit(f'EasyOCR error: {e}')
-            self.finished.emit('')
-            return
-        self.log.emit('EasyOCR ready. Waiting for frames…')
-
-        rois = self._load_all_rois()
-
-        while self._running:
-            try:
-                frame = self._queue.get(timeout=0.5)
-            except Empty:
-                continue
-
-            try:
-                self._frame_count += 1
-                if self.rotate:
-                    frame = cv2.rotate(frame, cv2.ROTATE_180)
-
-                mu1 = mu2 = mu_rate = progress = None
-                # เวลาจริงจากนาฬิกาเครื่อง — เทียบกับ raw file ได้ตรงๆ (ไม่ OCR วันเวลาจากภาพ
-                # เพราะ FOV ต่ำ/เบลอ อ่านไม่ได้อยู่แล้ว)
-                _now = datetime.now()
-                date_text = _now.strftime('%Y-%m-%d')
-                time_text = _now.strftime('%H:%M:%S.%f')[:-3]
-
-                if rois.get('mu1_roi'):
-                    r = self._ocr_one(reader, frame, rois['mu1_roi'])
-                    mu1 = self._validate_mu(r)
-                if rois.get('mu2_roi'):
-                    r = self._ocr_one(reader, frame, rois['mu2_roi'])
-                    mu2 = self._validate_mu(r)
-                mu1, mu2 = self._check_mu_pair(mu1, mu2)
-
-                if rois.get('mu_rate_roi'):
-                    r = self._ocr_one(reader, frame, rois['mu_rate_roi'])
-                    mu_rate = self._validate_mu_rate(r)
-
-                if rois.get('progress_roi'):
-                    r = self._ocr_one(reader, frame, rois['progress_roi'])
-                    progress, loop_done = self._validate_progress(r)
-                    if loop_done:
-                        self.log.emit('Loop complete (progress reset detected)')
-                        self.loop_complete.emit()
-
-                entry = {
-                    'frame':    self._frame_count,
-                    'mu1':      mu1,    'mu2':      mu2,
-                    'mu_rate':  mu_rate,'progress': progress,
-                    'date':     date_text, 'time':  time_text,
-                }
-                self.data_log.append(entry)
-                self.data_point.emit(entry)
-                self.log.emit(
-                    f'[MU] {self._frame_count}: '
-                    f'MU={mu1}/{mu2}  Rate={mu_rate}  Prog={progress}%'
-                )
-            except Exception as e:
-                self.log.emit(f'[OCR] frame {self._frame_count} error (ข้าม): {e}')
-
-        # save CSV
-        csv_out = ''
-        try:
-            if self.data_log:
-                import pandas as pd
-                df = pd.DataFrame(self.data_log)
-                df.to_csv(self.output_csv, index=False)
-                self.log.emit(f'CSV saved: {self.output_csv}')
-                csv_out = self.output_csv
-            else:
-                self.log.emit('No data collected.')
-        except Exception as e:
-            self.log.emit(f'CSV save error: {e}')
-        self.finished.emit(csv_out)
-
-    # ── ROI helpers ──────────────────────────────────────────────────────────
-
-    def _save_crop(self, frame, debug_dir, name, coords):
-        x1, y1, x2, y2 = self._bbox(coords)
-        fh, fw = frame.shape[:2]
-        x1, x2 = max(0, x1), min(fw, x2)
-        y1, y2 = max(0, y1), min(fh, y2)
-        if x2 <= x1 or y2 <= y1:
-            self.log.emit(f'{name}: ROI อยู่นอกขอบ frame ({fw}x{fh}), ข้าม')
-            return
-        crop = frame[y1:y2, x1:x2]
-        if crop.size == 0:
-            return
-        path = os.path.join(debug_dir, f'{self._frame_count:04d}_{name}.jpg')
-        cv2.imwrite(path, crop)
-
-    def _load_all_rois(self):
-        rois = {}
-        for name in ROI_NAMES:
-            coords = _load_roi_file(os.path.join(self.roi_dir, f'{name}.txt'))
-            if coords:
-                rois[name] = coords
-                self.log.emit(f'Loaded {name}: {len(coords)} points')
-            else:
-                self.log.emit(f'{name}: not found, skipping')
-        return rois
-
-    def _bbox(self, coords):
-        xs = [p[0] for p in coords]
-        ys = [p[1] for p in coords]
-        return min(xs), min(ys), max(xs), max(ys)
-
-    def _clip_roi(self, frame, coords):
-        x1, y1, x2, y2 = self._bbox(coords)
-        fh, fw = frame.shape[:2]
-        x1, x2 = max(0, x1), min(fw, x2)
-        y1, y2 = max(0, y1), min(fh, y2)
-        if x2 <= x1 or y2 <= y1:
-            return None
-        crop = frame[y1:y2, x1:x2]
-        if crop.size == 0:
-            return None
-        # resize ให้ height ไม่เกิน 120px — OCR เร็วขึ้นมาก ความแม่นยังดี
-        h, w = crop.shape[:2]
-        if h > 120:
-            scale = 120 / h
-            crop = cv2.resize(crop, (int(w * scale), 120), interpolation=cv2.INTER_AREA)
-        return crop
-
-    def _ocr_two(self, reader, frame, coords):
-        roi = self._clip_roi(frame, coords)
-        if roi is None:
-            return None, None
-        try:
-            res = reader.readtext(roi)
-            return (res[0][1] if len(res) > 0 else None,
-                    res[1][1] if len(res) > 1 else None)
-        except Exception:
-            return None, None
-
-    def _ocr_one(self, reader, frame, coords):
-        roi = self._clip_roi(frame, coords)
-        if roi is None:
-            return None
-        try:
-            res = reader.readtext(roi)
-            return res[0][1] if res else None
-        except Exception:
-            return None
-
-    # ── Validation (ported from video/get_mu.py) ─────────────────────────────
-
-    def _to_float(self, text):
-        if not text:
-            return None
-        try:
-            return float(re.sub(r'[^\d.]', '', text))
-        except ValueError:
-            return None
-
-    def _validate_mu(self, text):
-        n = self._to_float(text)
-        if n is None:
-            return None
-        if 0 <= n <= 40000:
-            return n
-        if n > 1000000:
-            s = str(int(n))
-            if len(s) >= 7:
-                try:
-                    c = float(s[:2] + s[2:5] + '.' + s[5:7])
-                    if 0 <= c <= 40000:
-                        return c
-                except Exception:
-                    pass
-        return None
-
-    def _check_mu_pair(self, mu1, mu2):
-        # MU สะสมลดไม่ได้จริง — ดักขาลง; ขาขึ้นต้องเห็นเฟรมถัดไป >= candidate ก่อนถึงเชื่อ
-        # (กัน OCR misread โดดขึ้นแป๊บเดียวแล้วมาล็อกเป็นค่าจริงถาวรเพราะห้ามลด)
-        if mu1 is not None and self._last_mu1 is not None and self._last_mu1 > 0:
-            if mu1 < self._last_mu1:
-                mu1 = self._last_mu1
-                self._pending_mu1 = None
-            elif mu1 > self._last_mu1:
-                if self._pending_mu1 is not None and mu1 >= self._pending_mu1:
-                    self._pending_mu1 = None
-                else:
-                    self._pending_mu1 = mu1
-                    mu1 = self._last_mu1
-            else:
-                self._pending_mu1 = None
-        if mu2 is not None and self._last_mu2 is not None and self._last_mu2 > 0:
-            if mu2 < self._last_mu2:
-                mu2 = self._last_mu2
-                self._pending_mu2 = None
-            elif mu2 > self._last_mu2:
-                if self._pending_mu2 is not None and mu2 >= self._pending_mu2:
-                    self._pending_mu2 = None
-                else:
-                    self._pending_mu2 = mu2
-                    mu2 = self._last_mu2
-            else:
-                self._pending_mu2 = None
-        if mu1 is not None and mu2 is not None and abs(mu1 - mu2) > 500:
-            mu1, mu2 = self._last_mu1, self._last_mu2
-        if mu1 is not None:
-            self._last_mu1 = mu1
-        if mu2 is not None:
-            self._last_mu2 = mu2
-        return mu1, mu2
-
-    def _validate_mu_rate(self, text):
-        n = self._to_float(text)
-        if not n:
-            return None
-        if 10000 <= n <= 300000:
-            return n
-        # OCR อาจอ่าน decimal point เป็น comma/space → "52381.4" → 523814
-        if 100000 <= n <= 3000000:
-            candidate = n / 10
-            if 10000 <= candidate <= 300000:
-                return candidate
-        return None
-
-    def _validate_progress(self, text):
-        """Returns (value, loop_complete)."""
-        # loop reset: progress was ≥99% last frame
-        if (self._last_progress is not None
-                and self._last_progress >= 99):
-            self._last_progress = 0
-            self._last_mu1 = None
-            self._last_mu2 = None
-            return 0, True
-
-        if not text:
-            return self._last_progress, False
-
-        n = self._to_float(text)
-        # OCR บางครั้งอ่าน '.' เป็น space เช่น '69 28%' → ลอง replace space ด้วย '.'
-        if (n is None or n > 100) and text:
-            alt = re.sub(r'(\d)\s+(\d)', r'\1.\2', text)
-            n2 = self._to_float(alt)
-            if n2 is not None and 0 <= n2 <= 100:
-                n = n2
-        if n is None or not (0 <= n <= 100):
-            return self._last_progress, False
-
-        # progress ลดกลางลูปไม่ได้จริง (loop reset ถูกจัดการแยกไว้ข้างบนแล้ว) — ดักขาลง
-        if self._last_progress is not None and n < self._last_progress:
-            return self._last_progress, False
-
-        # reject jumps > 5% upward in one step
-        if (self._last_progress is not None
-                and n > self._last_progress
-                and abs(n - self._last_progress) > 5):
-            return self._last_progress, False
-
-        self._last_progress = n
-        return n, False
-
-    def _parse_time(self, text):
-        if not text:
-            return None, None
-        month_map = {
-            'jan': '01', 'feb': '02', 'mar': '03', 'apr': '04',
-            'may': '05', 'jun': '06', 'jul': '07', 'aug': '08',
-            'sep': '09', 'oct': '10', 'nov': '11', 'dec': '12',
-        }
-        pat = (r'(\d{1,2})[.:,](\d{1,2})[.:,]?(\d{0,2})\s+'
-               r'(\d{1,2})\s*[.-]?\s*([A-Za-z]{3})\s*[.-]?\s*(\d{4})')
-        m = re.search(pat, text)
-        if m:
-            h  = m.group(1).zfill(2)
-            mi = m.group(2).zfill(2)
-            s  = (m.group(3) or '00').zfill(2)
-            d  = m.group(4).zfill(2)
-            mo = month_map.get(m.group(5).lower(), '01')
-            y  = m.group(6)
-            return f'{d}/{mo}/{y}', f'{h}:{mi}:{s}'
-        return None, None
-
-
 # ── SSHWorker ─────────────────────────────────────────────────────────────────
 
 class SSHWorker(QThread):
@@ -503,47 +176,50 @@ class SSHWorker(QThread):
             self.log.emit(f'SSH: SCP exception ({label}): {e}')
 
     def run(self):
-        if not self.csv_path or not os.path.exists(self.csv_path):
-            self.log.emit('SSH: no CSV file to send.')
+        have_csv   = bool(self.csv_path and os.path.exists(self.csv_path))
+        have_video = bool(self.video_path and os.path.exists(self.video_path))
+        if not have_csv and not have_video:
+            self.log.emit('SSH: no CSV or video file to send.')
             self.finished.emit()
             return
 
         dest_base = f'{self.ssh_addr}:{self.remote_path}'
 
-        # 1. SCP mu_frame_v2.py ไปก่อน (ถ้ามี)
-        if self.script_path and os.path.exists(self.script_path):
-            self._scp(self.script_path, f'{dest_base}/', 'mu_frame_v2.py')
+        if have_csv:
+            # 1. SCP mu_frame_v2.py ไปก่อน (ถ้ามี)
+            if self.script_path and os.path.exists(self.script_path):
+                self._scp(self.script_path, f'{dest_base}/', 'mu_frame_v2.py')
 
-        # 2. สร้าง csv/ subfolder บน server แล้ว SCP CSV
-        csv_remote_dir = f'{self.remote_path}/csv'
-        try:
-            subprocess.run(
-                ['sshpass', '-p', self.password, 'ssh', self.ssh_addr,
-                 '-o', 'StrictHostKeyChecking=no',
-                 f'mkdir -p {csv_remote_dir}'],
-                capture_output=True, timeout=15)
-        except Exception:
-            pass
-        self._scp(self.csv_path, f'{self.ssh_addr}:{csv_remote_dir}/', 'CSV')
-
-        # 3. Run remote command (track_csv.py)
-        if self.remote_cmd.strip():
-            self.log.emit('SSH: กำลังสร้างกราฟ…')
-            ssh_cmd = ['sshpass', '-p', self.password,
-                       'ssh', self.ssh_addr, '-o', 'StrictHostKeyChecking=no',
-                       self.remote_cmd]
+            # 2. สร้าง csv/ subfolder บน server แล้ว SCP CSV
+            csv_remote_dir = f'{self.remote_path}/csv'
             try:
-                r = subprocess.run(ssh_cmd, capture_output=True, text=True, timeout=300)
-                if r.stdout:
-                    self.log.emit(f'SSH: {r.stdout.strip()[:400]}')
-                if r.returncode != 0:
-                    self.log.emit(f'SSH error: {r.stderr.strip()[:200]}')
-            except Exception as e:
-                self.log.emit(f'SSH exception: {e}')
+                subprocess.run(
+                    ['sshpass', '-p', self.password, 'ssh', self.ssh_addr,
+                     '-o', 'StrictHostKeyChecking=no',
+                     f'mkdir -p {csv_remote_dir}'],
+                    capture_output=True, timeout=15)
+            except Exception:
+                pass
+            self._scp(self.csv_path, f'{self.ssh_addr}:{csv_remote_dir}/', 'CSV')
 
-        # 4. Video → SCP + รัน ocr_video.py บนเซิร์ฟเวอร์ (GPU) — best-effort,
-        #    ไม่ให้ error ตรงนี้กระทบผลลัพธ์ CSV/กราฟที่ได้ไปแล้วข้างบน
-        if self.video_path and os.path.exists(self.video_path):
+            # 3. Run remote command (track_csv.py)
+            if self.remote_cmd.strip():
+                self.log.emit('SSH: กำลังสร้างกราฟ…')
+                ssh_cmd = ['sshpass', '-p', self.password,
+                           'ssh', self.ssh_addr, '-o', 'StrictHostKeyChecking=no',
+                           self.remote_cmd]
+                try:
+                    r = subprocess.run(ssh_cmd, capture_output=True, text=True, timeout=300)
+                    if r.stdout:
+                        self.log.emit(f'SSH: {r.stdout.strip()[:400]}')
+                    if r.returncode != 0:
+                        self.log.emit(f'SSH error: {r.stderr.strip()[:200]}')
+                except Exception as e:
+                    self.log.emit(f'SSH exception: {e}')
+
+        # 4. Video → SCP ไปเก็บไว้เฉยๆ — ไม่สั่งรัน ocr_video.py อัตโนมัติ
+        #    (รันเองทีหลังตอนต้องการ ผ่าน SSH ด้วยมือ)
+        if have_video:
             try:
                 video_remote_dir = f'{self.remote_path}/video'
                 subprocess.run(
@@ -552,26 +228,8 @@ class SSHWorker(QThread):
                      f'mkdir -p {video_remote_dir}'],
                     capture_output=True, timeout=15)
                 self._scp(self.video_path, f'{self.ssh_addr}:{video_remote_dir}/', 'video')
-
-                local_ocr_script = os.path.join(
-                    os.path.dirname(os.path.dirname(os.path.dirname(
-                        os.path.abspath(__file__)))),
-                    'ocr_video.py')
-                if os.path.exists(local_ocr_script):
-                    self._scp(local_ocr_script, f'{dest_base}/', 'ocr_video.py')
-                    remote_video = f'{video_remote_dir}/{os.path.basename(self.video_path)}'
-                    ocr_cmd = f'~/sutpct-env/bin/python3 {self.remote_path}/ocr_video.py {remote_video}'
-                    self.log.emit('SSH: กำลังรัน OCR วิดีโอบนเซิร์ฟเวอร์ (GPU)…')
-                    r = subprocess.run(
-                        ['sshpass', '-p', self.password, 'ssh', self.ssh_addr,
-                         '-o', 'StrictHostKeyChecking=no', ocr_cmd],
-                        capture_output=True, text=True, timeout=600)
-                    if r.returncode == 0:
-                        self.log.emit('SSH: OCR วิดีโอเสร็จแล้ว (ผลลัพธ์อยู่บนเซิร์ฟเวอร์ในโฟลเดอร์ video/)')
-                    else:
-                        self.log.emit(f'SSH: OCR วิดีโอ error: {r.stderr.strip()[:200]}')
             except Exception as e:
-                self.log.emit(f'SSH: video OCR exception: {e}')
+                self.log.emit(f'SSH: video upload exception: {e}')
 
         self.finished.emit()
 
@@ -979,24 +637,24 @@ class SettingsPage(QWidget):
         self._refresh_roi_status()
 
 
-# ── MuTracker — used by run.py to track during a beam run ────────────────────
+# ── MuTracker — records video for offline GPU OCR during a beam run ──────────
+# Live OCR (EasyOCR on-CPU, real-time) ถูกถอดออกแล้ว — ความแม่นยำจำกัดด้วย
+# ฮาร์ดแวร์ (font เล็ก + moire ตอนถ่ายจอ, ยืนยันด้วย ocr_video.py --save-frames)
+# ไม่ใช่เรื่องที่ sampling ถี่ขึ้นจะแก้ได้ ดู memory: project-mu-ocr-pipeline
+# เหลือแค่อัดวิดีโอ ROI แล้วส่งไป reprocess บน GPU server (ocr_video.py) แทน
 
-_FRAME_INTERVAL = 3   # feed OCR every N camera frames
 _REC_CROP_W, _REC_CROP_H = 320, 80   # size per ROI strip in recorded video
 
 class MuTracker:
-    """Headless camera + OCR tracker. Call start() when run begins, stop() when done."""
+    """Headless camera recorder. Call start() when run begins, stop() when done."""
 
-    def __init__(self, output_dir, ssh_addr='', ssh_path='', ssh_pass='',
-                 log_fn=None, data_fn=None):
+    def __init__(self, output_dir, ssh_addr='', ssh_path='', ssh_pass='', log_fn=None):
         self._output_dir = output_dir
         self._ssh_addr   = ssh_addr
         self._ssh_path   = ssh_path
         self._ssh_pass   = ssh_pass
         self._log        = log_fn or (lambda msg: None)
-        self._data_fn    = data_fn  # called with each data dict in real-time
         self._cam_thread   = None
-        self._track_worker = None
         self._ssh_worker   = None
         self._frame_count  = 0
         self._video_writer = None
@@ -1028,7 +686,7 @@ class MuTracker:
         self._log(msg)
 
     def prepare(self):
-        """Pre-init EasyOCR ตั้งแต่ตอน Launch — เรียกก่อน start()"""
+        """เช็คว่ากล้องพร้อมก่อน Run — เรียกตอน Launch"""
         if not self._roi_files_exist():
             self._log_both('no ROI files found — skip prepare')
             return
@@ -1037,33 +695,12 @@ class MuTracker:
         cap.release()
         if not ok:
             self._log_both(f'camera {self._source!r} not available — skip prepare')
-            return
-
-        ts = datetime.now().strftime('%Y%m%d_%H%M%S')
-        csv_dir  = os.path.join(self._output_dir, 'csv')
-        self._csv_path = os.path.join(csv_dir, f'mu_tracking_{ts}.csv')
-        os.makedirs(csv_dir, exist_ok=True)
-
-        self._track_worker = TrackingWorker(VIDEO_DIR, self._csv_path, self._rotate)
-        self._track_worker.log.connect(self._log_both)
-        self._track_worker.finished.connect(self._on_finished)
-        if self._data_fn:
-            self._track_worker.data_point.connect(self._data_fn)
-        self._track_worker.start()
-        self._log_both('EasyOCR กำลัง init (pre-warm)…')
 
     def start(self):
-        """เริ่ม camera และป้อน frame — เรียกตอนกด Run"""
+        """เริ่ม camera และอัดวิดีโอ — เรียกตอนกด Run"""
         if not self._roi_files_exist():
             self._log_both('no ROI files found — skipping')
             return
-
-        # ถ้า prepare() ยังไม่ถูกเรียก หรือ worker ตายไปแล้ว → เริ่มใหม่
-        if not getattr(self, '_track_worker', None) or not self._track_worker.isRunning():
-            self._log_both('OCR ยังไม่ ready — กำลัง init ใหม่…')
-            self.prepare()
-            if not self._track_worker or not self._track_worker.isRunning():
-                return
 
         self._frame_count = 0
         self._cam_thread  = CameraThread(self._source,
@@ -1072,7 +709,7 @@ class MuTracker:
         self._cam_thread.error.connect(self._log_both)
         self._cam_thread.start()
         self._start_recording()
-        self._log_both(f'camera เริ่มแล้ว → บันทึกไปที่ {self._csv_path}')
+        self._log_both('camera เริ่มแล้ว')
 
     def _start_recording(self):
         self._rec_rois = {}
@@ -1118,20 +755,13 @@ class MuTracker:
             self._video_writer.release()
             self._video_writer = None
             self._log_both(f'video saved → {self._video_path}')
-        if self._track_worker and self._track_worker.isRunning():
-            self._track_worker.stop()
+            self._upload_video()
 
     def _on_frame(self, frame):
         self._frame_count += 1
-        if (self._track_worker and self._track_worker.isRunning()
-                and self._frame_count % _FRAME_INTERVAL == 0):
-            self._track_worker.feed_frame(frame.copy())
         self._write_video_frame(frame)
 
-    def _on_finished(self, csv_path):
-        self._log_both(f'MU Tracker: CSV saved → {csv_path}')
-        if not csv_path:
-            return
+    def _upload_video(self):
         if not (self._ssh_addr and self._ssh_path and self._ssh_pass):
             missing = []
             if not self._ssh_addr:
@@ -1143,20 +773,9 @@ class MuTracker:
             self._log_both(f'MU Tracker: ข้าม SSH — ไม่มี {", ".join(missing)}')
             return
 
-        csv_filename  = os.path.basename(csv_path)
-        remote_csv    = f'{self._ssh_path}/csv/{csv_filename}'
-        remote_mu     = f'{self._ssh_path}/mu_rate'
-        remote_script = f'{self._ssh_path}/mu_vs_frame.py'
-        remote_cmd    = (
-            f'mkdir -p {remote_mu} && '
-            f'~/sutpct-env/bin/python3 {remote_script} {remote_csv} {remote_mu}'
-        )
-        local_script  = os.path.join(VIDEO_DIR, 'mu_vs_frame.py')
-
-        self._log_both('MU Tracker: กำลัง SCP CSV → server…')
+        self._log_both('MU Tracker: กำลัง SCP วิดีโอ → server…')
         self._ssh_worker = SSHWorker(
-            csv_path, self._ssh_addr, self._ssh_path, self._ssh_pass,
-            remote_cmd=remote_cmd, script_path=local_script,
+            '', self._ssh_addr, self._ssh_path, self._ssh_pass,
             video_path=self._video_path)
         self._ssh_worker.log.connect(self._log_both)
         self._ssh_worker.finished.connect(self._on_ssh_done)

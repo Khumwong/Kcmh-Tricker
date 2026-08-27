@@ -1041,34 +1041,7 @@ class RunWidget(QWidget):
 
         outer.addLayout(row)
 
-        # MU values row
-        mu_row = QHBoxLayout()
-        mu_row.setSpacing(20)
-        mu_style = "QLabel { font-size: 13px; color: #80d8ff; font-family: monospace; font-weight: bold; }"
-        self._inline_mu_labels = {
-            'mu1':      QLabel("MU1: —"),
-            'mu2':      QLabel("MU2: —"),
-            'mu_rate':  QLabel("Rate: —"),
-            'progress': QLabel("Progress: —"),
-        }
-        for lbl in self._inline_mu_labels.values():
-            lbl.setStyleSheet(mu_style)
-            mu_row.addWidget(lbl)
-        mu_row.addStretch(1)
-        outer.addLayout(mu_row)
-
         return section
-
-    def _on_mu_data(self, entry):
-        mu1  = entry.get('mu1')
-        mu2  = entry.get('mu2')
-        rate = entry.get('mu_rate')
-        prog = entry.get('progress')
-        def _fmt(v): return f'{v:.1f}' if isinstance(v, float) else '—'
-        self._inline_mu_labels['mu1'].setText(f"MU1: {_fmt(mu1)}")
-        self._inline_mu_labels['mu2'].setText(f"MU2: {_fmt(mu2)}")
-        self._inline_mu_labels['mu_rate'].setText(f"Rate: {_fmt(rate)}")
-        self._inline_mu_labels['progress'].setText(f"Progress: {_fmt(prog)}%")
 
     def _show_progress_section(self):
         # sync position labels with current phantom position
@@ -1082,8 +1055,6 @@ class RunWidget(QWidget):
         self._inline_progress_bar.setValue(0)
         self._inline_progress_bar.setFormat('')
         self._inline_cancel_btn.setEnabled(True)
-        for key, lbl in self._inline_mu_labels.items():
-            lbl.setText(f"{'MU1' if key=='mu1' else 'MU2' if key=='mu2' else 'Rate' if key=='mu_rate' else 'Progress'}: —")
 
     def _cancel_eudaq(self):
         self._run_active = False
@@ -2121,9 +2092,8 @@ class RunWidget(QWidget):
                 ssh_path=self._rsync_path_edit.text().strip(),
                 ssh_pass=self._rsync_mgr._password or '',
                 log_fn=self.log,
-                data_fn=self._on_mu_data,
             )
-            # pre-warm EasyOCR ทันที ไม่รอกด Run
+            # เช็คกล้องพร้อมทันที ไม่รอกด Run
             self._mu_tracker.prepare()
             # .start() (เริ่ม camera) จะถูกเรียกใน RunProgress._start_worker()
         # แสดง progress section ใน main window — ไม่ต้องเปิด dialog แยก
@@ -2147,8 +2117,9 @@ class RunWidget(QWidget):
         self.log("Run stopped")
         if hasattr(self, '_mu_tracker') and self._mu_tracker:
             self._mu_tracker.stop()
-            # ไม่ set None ทันที — รอให้ TrackingWorker เสร็จแล้ว emit finished
-            # แล้ว SSHWorker จึงทำงานได้ (PyQt5 weak-ref ถ้า GC ก็ไม่ได้ signal)
+            # ไม่ set None ทันที — stop() spawn SSHWorker (อัปโหลดวิดีโอ) เป็น QThread
+            # ไว้ใน self._mu_tracker._ssh_worker ถ้า mu_tracker โดน GC ไปก่อน thread จบ
+            # จะเสี่ยง "QThread destroyed while running"
         # QA mode: ส่ง disable bytes และ close serial port ทันที (ไม่มี kill beam flow)
         if self._window._qa_mode and self._ser is not None:
             try:
