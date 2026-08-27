@@ -1,5 +1,0 @@
-run,label,start_x,start_y,start_r,num_alpides,num_events,strobe,ithr,energy,MU,current,Exposure time (ms),Beam delay (ms),Loops,Trigger Freq. (Hz),X step (mm),Y step (mm),R step (degree)
-1,,22,0,0,6,30000,100,60,200,1000,10,1000,200,5,9500,0,0,0
-2,,2,0,0,6,30000,100,60,200,1000,10,1000,200,15,9500,0,0,0
-3,,90,0,0,6,30000,100,60,200,1000,10,1000,200,30,9500,0,0,0
-4,,0,0,0,6,30000,100,60,200,1000,10,1000,200,60,9500,0,0,0
