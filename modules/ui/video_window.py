@@ -720,7 +720,7 @@ class MuTracker:
         if not self._rec_rois:
             return
         ts = datetime.now().strftime('%Y%m%d_%H%M%S')
-        vid_dir = os.path.join(self._output_dir, 'csv')
+        vid_dir = os.path.join(self._output_dir, 'video')
         os.makedirs(vid_dir, exist_ok=True)
         self._video_path = os.path.join(vid_dir, f'mu_video_{ts}.mp4')
         fourcc = cv2.VideoWriter_fourcc(*'mp4v')

@@ -75,9 +75,11 @@ def gen_its3_conf(num_alpides, num_evt, strobe_length, i_threshold, outpath):
 
         f.write(f"[DataCollector.dc]\n")
         f.write(f"EUDAQ_FW = native\n")
-        # output path
+        # output path — raw files go in <outpath>/raw/ to mirror the server layout
         #out_path = '/home/directory'
-        f.write(f"EUDAQ_FW_PATTERN = {path.join(outpath, 'run$6R_$12D$X')}\n")
+        raw_dir = path.join(outpath, 'raw')
+        os.makedirs(raw_dir, exist_ok=True)
+        f.write(f"EUDAQ_FW_PATTERN = {path.join(raw_dir, 'run$6R_$12D$X')}\n")
 
 def run(fname):
     # fname = '_'.join("X0Y0Z0R0, stp5rpt4, e70MeV, 1000MU, 200nA".split(', '))

@@ -35,15 +35,17 @@ Installs Python dependencies (`PyQt5`, `zaber-motion`, `pyserial`, `pyusb`), apt
 
 ## Data Processing Scripts
 
+All scripts that run **on the remote server** live in `remote_scripts/`. On rsync connect, `RsyncManager` ships every `*.py` and `*.md` in that folder to `<remote_path>/scripts/` — so adding a new server-side script means dropping it in `remote_scripts/`, nothing else. `remote_scripts/README.md` documents every script's CLI and ships with them.
+
 ```bash
 # Convert a raw EUDAQ file to ROOT (run on remote server via SSH)
-python3 StdEventMonitor_fast.py <raw_file> -o <output.root>
+python3 remote_scripts/StdEventMonitor_fast.py <raw_file> -o <output.root>
 
 # Same, with per-job CPU/RAM/disk/GPU stats logged to stdout
-python3 run_with_stats.py <raw_file> -o <output.root>
+python3 remote_scripts/run_with_stats.py <raw_file> -o <output.root>
 ```
 
-`run_with_stats.py` is a wrapper that spawns `StdEventMonitor_fast.py` as a subprocess and samples `psutil` metrics every 0.5 s. The UI triggers this remotely via SSH after each run.
+`run_with_stats.py` is a wrapper that spawns `StdEventMonitor_fast.py` as a subprocess (same dir) and samples `psutil` metrics every 0.5 s. The UI triggers this remotely via SSH after each run. `check_gating_consistency.py` and `ocr_video.py` are also in `remote_scripts/` and run server-side only.
 
 ## Architecture
 
@@ -86,7 +88,7 @@ The largest module (~4100+ lines). Contains:
 - `modules/zaber/connect.py`: wraps `zaber_motion.ascii.Connection.open_serial_port()`
 - `modules/zaber/motion.py`: all Zaber moves use `asyncio.gather` for parallel X/Y/R movement. Limits: X ≤ 150 mm, Y ≤ 40 mm, R ≤ 360°.
 - `modules/alpide.py`: detects ALPIDE DAQs by USB VID/PID. Three states: raw (unprogrammed, VID `0x04B4` PID `0x00F3`), programmed (VID `0x1556` PID `0x01B8`), or absent. Six specific DAQ serial numbers are hardcoded.
-- `modules/eudaq.py`: generates EUDAQ2 `.ini`/`.conf` files in `/home/santa/eudaq2/user/ITS3/misc/`, then launches `ITS3start_auto_gen.sh` via `subprocess.Popen`. EUDAQ dir and ALPIDE serial numbers are hardcoded constants.
+- `modules/eudaq.py`: generates EUDAQ2 `.ini`/`.conf` files in `/home/santa/eudaq2/user/ITS3/misc/`, then launches `ITS3start_auto_gen.sh` via `subprocess.Popen`. EUDAQ dir and ALPIDE serial numbers are hardcoded constants. Raw files are written to `<outpath>/raw/` (created by `gen_its3_conf`) to mirror the remote server layout; `get_new_outfile()` in `run.py` scans that subdir. Recorded MU videos go to `<outpath>/video/` (`video_window.py` `_start_recording`), matching the server's `video/` folder.
 
 ### Simulation Mode (`modules/sim.py`)
 - `apply_sim()` monkey-patches every hardware module at runtime (serial port detection, FPGA, Zaber, ALPIDE, EUDAQ)

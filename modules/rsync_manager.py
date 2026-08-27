@@ -61,7 +61,7 @@ class RsyncManager(QObject):
     # ── connect internals ─────────────────────────────────────────────────────
 
     def _do_connect(self, addr, rpath, password):
-        import os as _os
+        import os as _os, glob as _glob
         _test_timeout = ['-o', 'ConnectTimeout=3']
         mkdir_cmd = (
             f'mkdir -p "{rpath}/raw" "{rpath}/root" "{rpath}/scripts" "{rpath}/log" "{rpath}/gating"'
@@ -87,11 +87,10 @@ class RsyncManager(QObject):
         _proj_root = _os.path.normpath(
             _os.path.join(_os.path.dirname(_os.path.abspath(__file__)), '..')
         )
-        scripts = [
-            _os.path.join(_proj_root, 'StdEventMonitor_fast.py'),
-            _os.path.join(_proj_root, 'run_with_stats.py'),
-            _os.path.join(_proj_root, 'check_gating_consistency.py'),
-        ]
+        # every .py / .md in remote_scripts/ is shipped to <rpath>/scripts/ on connect
+        _scripts_src = _os.path.join(_proj_root, 'remote_scripts')
+        scripts = sorted(_glob.glob(_os.path.join(_scripts_src, '*.py'))
+                         + _glob.glob(_os.path.join(_scripts_src, '*.md')))
         script_dest = f"{addr}:{rpath}/scripts/"
         if password:
             rsync_result = subprocess.run(

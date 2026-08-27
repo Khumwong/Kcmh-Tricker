@@ -1797,7 +1797,10 @@ class RunWidget(QWidget):
     def viewRawFile(self):
         options = QFileDialog.Options()
         options |= QFileDialog.DontUseNativeDialog
-        fileName, _ = QFileDialog.getOpenFileName(self,"QFileDialog.getOpenFileName()", self._outpath_label.text(),"RAW Files (*.raw)", options=options)
+        _raw_start = os.path.join(self._outpath_label.text(), 'raw')
+        if not os.path.isdir(_raw_start):
+            _raw_start = self._outpath_label.text()
+        fileName, _ = QFileDialog.getOpenFileName(self,"QFileDialog.getOpenFileName()", _raw_start,"RAW Files (*.raw)", options=options)
         if fileName:
             eudaq.monitor(fileName)
     
@@ -2342,8 +2345,9 @@ class RunWidget(QWidget):
         return "\n".join(lines) + "\n"
 
     def get_new_outfile(self):
+        raw_dir = os.path.join(self._outpath_label.text(), 'raw')
         try:
-            files = [os.path.join(self._outpath_label.text(), file) for file in os.listdir(self._outpath_label.text())]
+            files = [os.path.join(raw_dir, file) for file in os.listdir(raw_dir)]
         except FileNotFoundError:
             return None
         files = [myfile for myfile in files if os.path.isfile(myfile)]
