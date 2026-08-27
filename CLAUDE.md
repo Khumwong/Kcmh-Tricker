@@ -31,7 +31,9 @@ python3 main.py --sim
 bash install.sh
 ```
 
-Installs Python dependencies (`PyQt5`, `zaber-motion`, `pyserial`, `pyusb`), apt packages (`sshpass`, `tmux`), and creates desktop launchers and `launch_app.sh`.
+Installs Python dependencies (`PyQt5`, `zaber-motion`, `pyserial`, `pyusb`), apt packages (`sshpass`, `tmux`), and creates desktop launchers and `launch_app.sh` (both gitignored — machine-specific absolute paths).
+
+The end-user operating manual is `docs/MANUAL.txt`.
 
 ## Data Processing Scripts
 
@@ -83,7 +85,7 @@ The largest module (~4100+ lines). Contains:
 - Calls `modules.zaber.motion` functions directly
 
 ### Hardware Modules
-- `modules/serial_connect.py`: `get_port(device)` — identifies serial ports by USB hardware serial number (`"zaber"` → `AB0NSAIM`, `"fpga"` → `210183B5A8D0`). For FPGA, returns the last port in the list (DB-9 adapter enumeration order).
+- `modules/serial_connect.py`: `get_port(device)` — identifies serial ports by USB hardware serial number (`"zaber"` → `AB0NSAIM`, `"fpga"` → `210183B5A8D0`). For FPGA, returns the last port in the list (DB-9 adapter enumeration order). Run `python3 tools/find_device.py` to list attached serial devices and their serial numbers when hardware changes.
 - `modules/fpga/connect.py`: `check_connection(port)` — opens/closes port to verify FPGA is present
 - `modules/zaber/connect.py`: wraps `zaber_motion.ascii.Connection.open_serial_port()`
 - `modules/zaber/motion.py`: all Zaber moves use `asyncio.gather` for parallel X/Y/R movement. Limits: X ≤ 150 mm, Y ≤ 40 mm, R ≤ 360°.

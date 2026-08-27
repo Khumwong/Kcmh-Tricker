@@ -1,7 +1,0 @@
-[Desktop Entry]
-Type=Application
-Name=KCMH Trigger V2
-Exec=/home/santa/Workspace/kcmh-zaber-trigger/launch_app.sh
-Icon=/home/santa/Workspace/kcmh-zaber-trigger/images/scan-eye.svg
-Terminal=false
-Categories=Utility;
