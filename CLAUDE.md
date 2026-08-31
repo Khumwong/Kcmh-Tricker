@@ -85,7 +85,7 @@ The largest module (~4100+ lines). Contains:
 - Calls `modules.zaber.motion` functions directly
 
 ### Hardware Modules
-- `modules/serial_connect.py`: `get_port(device)` — identifies serial ports by USB hardware serial number (`"zaber"` → `AB0NSAIM`, `"fpga"` → `210183B5A8D0`). For FPGA, returns the last port in the list (DB-9 adapter enumeration order). Run `python3 tools/find_device.py` to list attached serial devices and their serial numbers when hardware changes.
+- `modules/serial_connect.py`: `get_port(device)` — identifies serial ports by USB hardware serial number (`"zaber"` → `AB0NSAIM`, `"fpga"` → `210183B5A8D0`). For FPGA, returns the last port in the list (DB-9 adapter enumeration order) — the FPGA is a dual-interface FT2232 that enumerates as two `/dev/ttyUSB*` nodes (interface .0 and .1) with the same serial `210183B5A8D0`; `get_port` picks the `.1` node. `python3 tools/find_device.py` lists the 6 ALPIDE DAQ indices found; for serial ports run `python3 -c "import serial.tools.list_ports as l; [print(p.device, p.hwid) for p in l.comports()]"`.
 - `modules/fpga/connect.py`: `check_connection(port)` — opens/closes port to verify FPGA is present
 - `modules/zaber/connect.py`: wraps `zaber_motion.ascii.Connection.open_serial_port()`
 - `modules/zaber/motion.py`: all Zaber moves use `asyncio.gather` for parallel X/Y/R movement. Limits: X ≤ 150 mm, Y ≤ 40 mm, R ≤ 360°.
