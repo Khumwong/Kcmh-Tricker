@@ -4,16 +4,7 @@ import os
 import signal
 from os import path
 import time
-import glob
 
-
-EUDAQ_DC      = "dc"
-EUDAQ_ID      = "3"
-CHIPID        = "16"
-VCLIP         = "0"
-IDB           = "29"
-STROBE_LENGTH = "100"
-ITHR          = "60"
 
 VCASNS = ["54", "55", "56", "56", "57", "55"]
 VCASN2S = ["66", "67", "68", "68", "69", "67"]
@@ -81,50 +72,48 @@ def gen_its3_conf(num_alpides, num_evt, strobe_length, i_threshold, outpath):
         os.makedirs(raw_dir, exist_ok=True)
         f.write(f"EUDAQ_FW_PATTERN = {path.join(raw_dir, 'run$6R_$12D$X')}\n")
 
-def run(fname):
-    # fname = '_'.join("X0Y0Z0R0, stp5rpt4, e70MeV, 1000MU, 200nA".split(', '))
-    start_sh = "ITS3start_auto.sh"
-    its3_ini = "ITS3_auto.ini"
-    conf = "ITS3-align-6plane-Vbb0-auto.conf"
-    conf_gen = "ITS3-align-6plane-Vbb0-auto-gen.conf"
-    eudaq_dir = EUDAQ_DIR
-    conf_path = path.join(eudaq_dir, conf)
-    conf_gen_path = path.join(eudaq_dir, conf_gen)
-    with open(conf_path, 'r') as f:
-        read_lines = f.readlines()
-    new_lines = []
-    for line in read_lines:
-        line = line.replace('{name}', fname)
-        line = line.replace('{outpath}', path.join(os.getcwd(), 'output'))
-        new_lines.append(line)
-    with open(conf_gen_path, 'w') as f:
-        f.writelines(new_lines)
-    command = f"cd {eudaq_dir} && ./{start_sh} && tmux a -t ITS3"
-    process = subprocess.Popen(['gnome-terminal', '--', 'bash', '-c', command])
-    return process.pid
+def _wait(seconds, pump, until=None):
+    """Sleep up to `seconds`, but keep the Qt event loop turning if `pump` is given
+    (pass QApplication.processEvents) so the embedded terminal keeps polling and the
+    UI does not freeze during the stop sequence. Returns early once `until()` is true."""
+    end = time.monotonic() + seconds
+    while time.monotonic() < end:
+        if until is not None and until():
+            return
+        if pump is not None:
+            try:
+                pump()
+            except Exception:
+                pass
+        time.sleep(0.05 if pump is not None else 0.1)
 
-def stop(pid):
-    time.sleep(1)
+
+_EUDAQ_PROCS = ('ITS3RunControl.py', 'ALPIDEProducer.py', 'ITS3DataCollector.py')
+
+
+def _pkill_eudaq():
+    """Reap any EUDAQ python process that outlived its tmux pane — orphan producers
+    hold the ALPIDE USB and make the next run's DataCollector hang at RUNNING."""
+    for name in _EUDAQ_PROCS:
+        subprocess.run(['pkill', '-9', '-f', name], capture_output=True)
+
+
+def stop(pid, pump=None, until_done=None):
+    _wait(3, pump)                                         # settle before 'T'
     subprocess.run(['tmux', 'send-keys', '-t', 'ITS3', 'T'])
-    time.sleep(5)
-    subprocess.run(['tmux', 'kill-session', '-t', 'ITS3'])
+    # wait for RunControl to reach TERMINATED (files are closed by then). It
+    # self-times-out at 13 s on a slow DataCollector (ITS3RunControl.wait_replicas)
+    # and then Terminate() needs ~2 s to propagate — allow 18 s, cut short as soon
+    # as the terminal has frozen on the TERMINATED frame.
+    _wait(2, pump)
+    _wait(18, pump, until=until_done)
+    subprocess.run(['tmux', 'kill-session', '-t', 'ITS3'], capture_output=True)
+    time.sleep(0.3)
+    _pkill_eudaq()
     try:
         os.killpg(os.getpgid(pid), signal.SIGTERM)
     except Exception:
         pass
-
-    
-def stop_auto(content, outfile):
-    os.chdir('./output')
-    file_list = filter(os.path.isfile, os.listdir('.'))
-    sorted_files = sorted(file_list, key=os.path.getmtime)
-    outfile.write(" => ".join(sorted_files[-1], content))
-    outfile.write("\n")
-    time.sleep(1)
-    subprocess.run(['tmux', 'send-keys', '-t', 'ITS3', 'T'])
-    time.sleep(5)
-    subprocess.run(['tmux', 'kill-session', '-t', 'ITS3'])
-    outfile.close()
 
 def default_run(qt_args, outpath):
     start_sh = "ITS3start_auto.sh"
@@ -138,6 +127,12 @@ def default_run(qt_args, outpath):
             else:
                 f.write(f"{line}")
     eudaq_dir = EUDAQ_DIR
+    # a lingering session from the previous run makes ITS3start's `tmux new-session`
+    # fail (the script then exits and no producers start); orphan producers hold the
+    # ALPIDE USB so the new DataCollector hangs at RUNNING. Start from a clean slate.
+    subprocess.run(['tmux', 'kill-session', '-t', 'ITS3'], capture_output=True)
+    _pkill_eudaq()
+    time.sleep(0.5)
     gen_its3_ini(int(qt_args["num_alpides"].text()))
     gen_its3_conf(int(qt_args["num_alpides"].text()), int(qt_args["num_events"].text()), int(qt_args["strobe"].text()),
                    int(qt_args["ithr"].text()), outpath)
@@ -153,13 +148,6 @@ def default_run(qt_args, outpath):
     return process.pid
     
 _ALPIDE_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), '..', 'alpide')
-
-def install_firware():
-    fx3  = os.path.join(_ALPIDE_DIR, 'fx3.img')
-    fpga = os.path.join(_ALPIDE_DIR, 'fpga-v1.0.0.bit')
-    command_alpide = f"alpide-daq-program --fx3={fx3} --fpga={fpga} --all"
-    command = f'gnome-terminal -- bash -c "{command_alpide}; exec bash"'
-    process = subprocess.Popen(command, shell=True)
 
 class _FirmwareWorker(object):
     """รัน alpide-daq-program ใน QThread — emit line_ready / finished"""

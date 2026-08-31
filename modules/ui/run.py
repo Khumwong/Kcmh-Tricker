@@ -1058,10 +1058,10 @@ class RunWidget(QWidget):
 
     def _cancel_eudaq(self):
         self._run_active = False
-        self._terminal_widget.terminate()
         self._hide_progress_section()
         if self._pid is not None:
-            eudaq.stop(self._pid)
+            eudaq.stop(self._pid, pump=QApplication.processEvents)
+        self._terminal_widget.clear()  # cancelled before a run — no final frame to keep
         if hasattr(self, '_mu_tracker') and self._mu_tracker:
             self._mu_tracker.stop()
         self._launch_eudaq_default.setEnabled(True)
@@ -2157,13 +2157,18 @@ class RunWidget(QWidget):
             self._kill_beam_btn.setEnabled(True)
             self._start_auto_kill_sequence()
         if self._pid is not None:
-            eudaq.stop(self._pid)  # terminal keeps logging during ~6s stop sequence
+            # pump=processEvents keeps the embedded terminal polling during the
+            # stop sequence, so it shows RUNNING → STOPPED → TERMINATED live and
+            # freezes itself on the TERMINATED frame; until_done ends the wait as
+            # soon as that happens (see EmbeddedTerminal.freeze)
+            eudaq.stop(self._pid, pump=QApplication.processEvents,
+                       until_done=lambda: self._terminal_widget._frozen)
             if self._window._qa_mode:
                 _toast_sub = "Acquisition complete — UI unlocked"
             else:
                 _toast_sub = "Auto-kill beam ใน 5 วินาที" if self._auto_kill_checkbox.isChecked() else "รอกด Kill beam"
             self._show_toast("Run complete ✓", _toast_sub)
-        self._terminal_widget.terminate()  # close log only after EUDAQ has stopped
+        self._terminal_widget.freeze()  # fallback if the settled-frame detection missed
 
         # QA sweep: wait for _vel_stop_run's background poll so the log records the
         # real end-of-sweep position, not the stale start position
@@ -2494,6 +2499,7 @@ class RunWidget(QWidget):
                 self._ser = None
                 self._vel_stop_run()
                 self._window.running(False)
+                self._terminal_widget.clear()  # unchecking Enable dismisses the ended ITS3 session
         except ValueError as e:
             fail_dialog = QMessageBox()
             fail_dialog.setIcon(QMessageBox.Icon.Warning)

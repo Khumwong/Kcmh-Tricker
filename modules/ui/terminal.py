@@ -82,6 +82,8 @@ _STATE_ABBR = {
     'UNCONFIGURED':  'UNCONF',
     'CONFIGURED':    'CONFIG',
     'RUNNING':       'RUN',
+    'STOPPED':       'STOP',
+    'TERMINATED':    'TERM',
     '--ERROR--':     'ERR',
     'WAIT':          'WAIT',
 }
@@ -218,9 +220,11 @@ class EmbeddedTerminal(QWidget):
         self._last_texts:   dict = {}
         self._last_states        = None
         self._last_log_time      = None
+        self._last_snapshot_text = None
         self._log_file           = None
         self.log_path            = None
         self._has_placeholder    = False
+        self._frozen             = False  # run ended — last frame kept until clear()
 
         layout = QVBoxLayout(self)
         layout.setContentsMargins(0, 0, 0, 0)
@@ -264,8 +268,15 @@ class EmbeddedTerminal(QWidget):
         """)
         self._send_btn.clicked.connect(self._send_keys)
         self._input_line.returnPressed.connect(self._send_keys)
+        self._clear_btn = QPushButton("Clear")
+        self._clear_btn.setFixedWidth(52)
+        self._clear_btn.setToolTip("Dismiss the ended ITS3 session")
+        self._clear_btn.setStyleSheet(self._send_btn.styleSheet())
+        self._clear_btn.clicked.connect(self.clear)
+        self._clear_btn.setVisible(False)
         input_row.addWidget(self._input_line)
         input_row.addWidget(self._send_btn)
+        input_row.addWidget(self._clear_btn)
         layout.addLayout(input_row)
 
         self._discover_timer = QTimer(self)
@@ -273,6 +284,8 @@ class EmbeddedTerminal(QWidget):
         self._discover_timer.timeout.connect(self._discover_panes)
 
     def launch(self, session_name: str = "ITS3", delay_ms: int = 1500):
+        if self._log_file and not self._log_file.closed:
+            self._log_file.close()
         self._session = session_name
         self._clear_all_panes()
         import tempfile as _tf, os as _os
@@ -364,8 +377,47 @@ class EmbeddedTerminal(QWidget):
         while self._pane_tabs.count():
             self._pane_tabs.removeTab(0)
         self._show_placeholder()
+        self._frozen = False
+        self._last_states = None
+        self._last_snapshot_text = None
+        self._clear_btn.setVisible(False)
+        self._input_line.setEnabled(True)
+        self._send_btn.setEnabled(True)
+
+    def freeze(self):
+        """Run ended: stop polling, keep the last RunControl frame on screen with
+        an 'ended' banner, and reveal the Clear button. Idempotent."""
+        if self._frozen:
+            return
+        self._frozen = True
+        self._discover_timer.stop()
+        for t in self._pane_timers.values():
+            t.stop()
+        from datetime import datetime as _dt
+        ts = _dt.now().strftime('%H:%M:%S')
+        banner = f"──────── ITS3 session ended · {ts} · press Clear ────────"
+        w = self._pane_widgets.get('0')
+        if w is not None:
+            w.append("")
+            w.append(banner)
+            sb = w.verticalScrollBar()
+            sb.setValue(sb.maximum())
+        if self._log_file and not self._log_file.closed:
+            self._log_file.close()
+        self._input_line.setEnabled(False)
+        self._send_btn.setEnabled(False)
+        self._clear_btn.setVisible(True)
+
+    def clear(self):
+        """Dismiss the frozen session (Clear button / Enable unchecked / new run)."""
+        self._clear_all_panes()
+        if self._log_file and not self._log_file.closed:
+            self._log_file.close()
+        self._session = None
 
     def _refresh_pane(self, pane_idx: str):
+        if self._frozen:
+            return
         target = f"{self._session}:{pane_idx}"
         result = subprocess.run(
             ['tmux', 'capture-pane', '-p', '-e', '-S', f'-{self.SCROLLBACK}', '-t', target],
@@ -377,9 +429,14 @@ class EmbeddedTerminal(QWidget):
         if text == self._last_texts.get(pane_idx):
             return
         self._last_texts[pane_idx] = text
+        settled = False
+        error_frame = False
         if pane_idx == '0':
             from datetime import datetime as _dt
-            states = tuple(self._STATE_RE.findall(text))
+            # capture-pane -e leaves ANSI colour codes around the state cell, so
+            # strip them before matching state names (STOPPED/TERMINATED/...)
+            plain = _COLOR_ANSI.sub('', _NON_COLOR_ANSI.sub('', text))
+            states = tuple(self._STATE_RE.findall(plain))
             now = _dt.now()
             state_changed = states != self._last_states
             time_elapsed = (
@@ -391,14 +448,26 @@ class EmbeddedTerminal(QWidget):
                 self._last_log_time = now
                 self._log_file.write(f"[{now.strftime('%H:%M:%S')}]\n{text}\n")
                 self._log_file.flush()
+            # classify the RunControl frame by the producer table
+            plane_rows = _PROD_ROW_RE.findall(plain)
+            plane_msgs = [r[4].strip().lower() for r in plane_rows]
+            # producers disconnected → table collapsed to ERR / XXX / 0: never show
+            # this, never freeze on it
+            error_frame = bool(plane_rows) and all(m == 'xxx' for m in plane_msgs)
+            # freeze only on the real TERMINATED frame — every producer reporting
+            # "Terminated". RunControl gets there on its own (wait_replicas has a
+            # timeout for a slow DataCollector), so don't shortcut on STOPPED /
+            # converged counts or the big status text is never seen to flip.
+            settled = bool(plane_rows) and all('terminat' in m for m in plane_msgs)
         widget = self._pane_widgets.get(pane_idx)
-        if not widget:
-            return
-        sb = widget.verticalScrollBar()
-        at_bottom = sb.value() >= sb.maximum() - 4
-        widget.setHtml(_ansi_to_html(text))
-        if at_bottom:
-            sb.setValue(sb.maximum())
+        if widget is not None and not error_frame:
+            sb = widget.verticalScrollBar()
+            at_bottom = sb.value() >= sb.maximum() - 4
+            widget.setHtml(_ansi_to_html(text))
+            if at_bottom:
+                sb.setValue(sb.maximum())
+        if settled:
+            self.freeze()
 
     def _send_keys(self):
         text = self._input_line.text()
@@ -418,8 +487,9 @@ class EmbeddedTerminal(QWidget):
         return '0'
 
     def force_snapshot(self):
-        """Force-write a log snapshot for pane 0 immediately (e.g. at end of each loop)."""
-        if not self._session or not self._log_file or self._log_file.closed:
+        """Force-write a log snapshot for pane 0 immediately (e.g. at end of each
+        loop). Skips the write if the pane text is identical to the last snapshot."""
+        if self._frozen or not self._session or not self._log_file or self._log_file.closed:
             return
         target = f"{self._session}:0"
         result = subprocess.run(
@@ -429,19 +499,20 @@ class EmbeddedTerminal(QWidget):
         if result.returncode != 0:
             return
         text = result.stdout
+        if text == self._last_snapshot_text:
+            return
         from datetime import datetime as _dt
         now = _dt.now()
-        self._last_states = tuple(self._STATE_RE.findall(text))
+        self._last_snapshot_text = text
+        plain = _COLOR_ANSI.sub('', _NON_COLOR_ANSI.sub('', text))
+        self._last_states = tuple(self._STATE_RE.findall(plain))
         self._last_log_time = now
         self._log_file.write(f"[{now.strftime('%H:%M:%S')}]\n{text}\n")
         self._log_file.flush()
 
+    # back-compat alias
     def terminate(self):
-        self._clear_all_panes()
-        if self._log_file and not self._log_file.closed:
-            self._log_file.close()
-        self._session = None
-        self._last_states = None
+        self.clear()
 
 
 # ── AppLogWidget ──────────────────────────────────────────────────────────────
