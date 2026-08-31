@@ -90,7 +90,7 @@ The largest module (~4100+ lines). Contains:
 - `modules/zaber/connect.py`: wraps `zaber_motion.ascii.Connection.open_serial_port()`
 - `modules/zaber/motion.py`: all Zaber moves use `asyncio.gather` for parallel X/Y/R movement. Limits: X ≤ 150 mm, Y ≤ 40 mm, R ≤ 360°.
 - `modules/alpide.py`: detects ALPIDE DAQs by USB VID/PID. Three states: raw (unprogrammed, VID `0x04B4` PID `0x00F3`), programmed (VID `0x1556` PID `0x01B8`), or absent. Six specific DAQ serial numbers are hardcoded.
-- `modules/eudaq.py`: generates EUDAQ2 `.ini`/`.conf` files in `/home/santa/eudaq2/user/ITS3/misc/`, then launches `ITS3start_auto_gen.sh` via `subprocess.Popen`. EUDAQ dir and ALPIDE serial numbers are hardcoded constants. Raw files are written to `<outpath>/raw/` (created by `gen_its3_conf`) to mirror the remote server layout; `get_new_outfile()` in `run.py` scans that subdir. Recorded MU videos go to `<outpath>/video/` (`video_window.py` `_start_recording`) and the local copy of each run log to `<outpath>/log/` — all mirroring the server's `raw/ video/ log/` layout.
+- `modules/eudaq.py`: generates EUDAQ2 `.ini`/`.conf` files in `EUDAQ_DIR` (`/home/kobdaj/eudaq2/user/ITS3/misc/`), then launches `ITS3start_auto_gen.sh` via `subprocess.Popen`. EUDAQ dir and ALPIDE serial numbers are hardcoded constants. `stop()` sends `T` (terminate) to the RunControl TUI, waits (pumping Qt events so the UI stays live) for it to reach `TERMINATED`, then `kill-session` + `pkill -9` any orphan `ITS3RunControl.py` / `ALPIDEProducer.py` / `ITS3DataCollector.py` — orphans from a previous run hold the ALPIDE USB and hang the next run's DataCollector. **Depends on the local EUDAQ patch — see below.** Raw files are written to `<outpath>/raw/` (created by `gen_its3_conf`) to mirror the remote server layout; `get_new_outfile()` in `run.py` scans that subdir. Recorded MU videos go to `<outpath>/video/` (`video_window.py` `_start_recording`) and the local copy of each run log to `<outpath>/log/` — all mirroring the server's `raw/ video/ log/` layout.
 
 ### Simulation Mode (`modules/sim.py`)
 - `apply_sim()` monkey-patches every hardware module at runtime (serial port detection, FPGA, Zaber, ALPIDE, EUDAQ)
@@ -128,7 +128,18 @@ Phases 0-4 need no hardware and print `PASS` / `FAIL` lines. See `tests/README.m
 
 **Never modify the DB-9 serial communication block in `modules/ui/run.py` `enable_beam()` at lines ~1789-1816 (the `serial.Serial(...)` open call and all `.write(b'\x...')` calls).** This controls the physical FPGA serial port — opening the port, sending reset bytes (`\x00 \x00`), enable byte (`\x02`), and disable byte (`\xF2`). These are the exact bytes expected by the FPGA firmware. Wrong bytes = incorrect beam control.
 
+## Local EUDAQ Patch (required, not tracked by this repo)
+
+The EUDAQ2 install lives at `/home/kobdaj/eudaq2/` (`EUDAQ_DIR` in `modules/eudaq.py` = its `user/ITS3/misc/`). It is a **separate git repo** whose `origin` is CERN's shared `alice-its3-wp3/eudaq2` — so a patch there is invisible to this repo's `git` and must be re-applied on any fresh machine/setup.
+
+**`user/ITS3/python/ITS3RunControl.py` — `wait_replicas()` STOPPED timeout.** On back-to-back runs a slow DataCollector can sit in `OnStopRun`→`StopListen` draining its receive queue and never broadcast `STATE_STOPPED`, so `wait_replicas(STATE_STOPPED)` spins forever and the RunControl TUI never reaches `TERMINATED`. The patch gives `wait_replicas` an optional `timeout=` and calls the STOPPED wait with `timeout=13` — on expiry it `EUDAQ_WARN`s and proceeds to `STOPPED`→`TERMINATED`→`Terminate()` (the collector's data is already written by then).
+
+`modules/eudaq.py` `stop()` depends on this: it waits up to ~20 s after sending `T` for the terminal to freeze on the real `TERMINATED` frame. Without the patch, slow-dc runs hang the ITS3 panel at `RUNNING` again. Applied on branch `kcmh-runcontrol-stopped-timeout` in the eudaq2 repo (commit `8d587f7`); revert with `git checkout master -- user/ITS3/python/ITS3RunControl.py`. `ITS3RunControl.py` is launched fresh by `ITS3start_auto_gen.sh` each run, so edits take effect with no app restart.
+
 ## Known Deferred Issues
+
+### QA long-run trigger desync (hardware)
+Consecutive QA runs with continuous windows ≥ ~20 s at 9750 Hz desync — planes' `Data EV#` diverge and the DataCollector logs `Warning! Out of sync!`. Short (~7 s) treatment runs at the same rate stay converged. Root cause is the free-running trigger vs. per-plane busy (a trigger lost during one plane's busy is a permanent offset that accumulates over tens of seconds), not the GUI. Fix direction: gate the wavegen/FPGA trigger with global busy, or drop the frequency for long runs. The GUI stop sequence now reaches `TERMINATED` on these runs anyway, and the frozen frame shows the per-plane counts so a bad run is visible at a glance.
 
 ### FPGA poll on main thread (low priority)
 `_update_firmware_label()` in `modules/ui/run.py` calls `fpga_connect.check_connection()` which opens `serial.Serial(port, timeout=1)` on the main thread every 2 seconds. Could block UI up to ~1 second per cycle. Not fixed yet — wait until lag is confirmed in real usage before addressing.
