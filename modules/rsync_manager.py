@@ -87,10 +87,12 @@ class RsyncManager(QObject):
         _proj_root = _os.path.normpath(
             _os.path.join(_os.path.dirname(_os.path.abspath(__file__)), '..')
         )
-        # every .py / .md in remote_scripts/ is shipped to <rpath>/scripts/ on connect
+        # every .py / .md / .cpp / .sh in remote_scripts/ is shipped to <rpath>/scripts/ on connect
         _scripts_src = _os.path.join(_proj_root, 'remote_scripts')
         scripts = sorted(_glob.glob(_os.path.join(_scripts_src, '*.py'))
-                         + _glob.glob(_os.path.join(_scripts_src, '*.md')))
+                         + _glob.glob(_os.path.join(_scripts_src, '*.md'))
+                         + _glob.glob(_os.path.join(_scripts_src, '*.cpp'))
+                         + _glob.glob(_os.path.join(_scripts_src, '*.sh')))
         script_dest = f"{addr}:{rpath}/scripts/"
         if password:
             rsync_result = subprocess.run(

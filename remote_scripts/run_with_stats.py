@@ -1,9 +1,13 @@
 #!/usr/bin/env python3
 """
-Wrapper: runs StdEventMonitor_fast.py and logs per-job CPU/RAM/IO stats every 0.5 s.
-Tracks only THIS job's process tree (main + mp.Pool workers), not the whole server.
+Wrapper: runs the raw -> ROOT monitor and logs per-job CPU/RAM/IO stats every 0.5 s.
+Tracks only THIS job's process tree (main + any children), not the whole server.
 All output goes to stdout so it ends up in _std.log.
 Usage: run_with_stats.py <raw_file> -o <root_file>
+
+Monitor selection: prefers the compiled C++ monitor StdEventMonitor_faster
+(built on demand via build_monitor.sh). If the source or build tools are missing
+or compilation fails, falls back to StdEventMonitor_fast.py so runs never break.
 """
 
 import os
@@ -135,10 +139,34 @@ def _root_file_size(argv):
         return ""
 
 
+def _resolve_monitor(script_dir):
+    """Return (cmd_prefix, human_name). Build the C++ monitor if needed, else
+    fall back to the Python monitor."""
+    src     = os.path.join(script_dir, "StdEventMonitor_faster.cpp")
+    binary  = os.path.join(script_dir, "StdEventMonitor_faster")
+    builder = os.path.join(script_dir, "build_monitor.sh")
+    py      = os.path.join(script_dir, "StdEventMonitor_fast.py")
+
+    need_build = os.path.isfile(src) and os.path.isfile(builder) and (
+        not os.access(binary, os.X_OK)
+        or os.path.getmtime(binary) < os.path.getmtime(src)
+    )
+    if need_build:
+        print("[build] compiling StdEventMonitor_faster ...", flush=True)
+        rc = subprocess.run(["bash", builder], stderr=subprocess.STDOUT).returncode
+        print(f"[build] exit {rc}", flush=True)
+
+    if os.access(binary, os.X_OK):
+        return [binary], "StdEventMonitor_faster (C++)"
+
+    print("[build] C++ monitor unavailable — using StdEventMonitor_fast.py", flush=True)
+    return [sys.executable, py], "StdEventMonitor_fast.py"
+
+
 def main():
-    script_dir     = os.path.dirname(os.path.abspath(__file__))
-    monitor_script = os.path.join(script_dir, "StdEventMonitor_fast.py")
-    cmd = [sys.executable, monitor_script] + sys.argv[1:]
+    script_dir           = os.path.dirname(os.path.abspath(__file__))
+    monitor_cmd, monitor_name = _resolve_monitor(script_dir)
+    cmd = monitor_cmd + sys.argv[1:]
 
     t_start     = time.monotonic()
     t_start_abs = datetime.now()
@@ -176,6 +204,7 @@ def main():
     print(
         f"\n--- Run Stats ---\n"
         f"  Host        : {hostname}\n"
+        f"  Monitor     : {monitor_name}\n"
         f"  Input       : {raw_file}\n"
         f"  Start       : {t_start_abs.strftime('%Y-%m-%d %H:%M:%S')}\n"
         f"  End         : {t_end_abs.strftime('%Y-%m-%d %H:%M:%S')}\n"

@@ -13,7 +13,7 @@ Layout ปลายทางบน server:
 ```
 <remote_path>/
 ├── raw/      run*.raw            ← rsync จาก GUI
-├── root/     run*.root           ← StdEventMonitor_fast.py สร้าง
+├── root/     run*.root           ← StdEventMonitor_faster (C++) หรือ _fast.py สร้าง
 ├── log/      run*.log            ← program log + tee ของ conversion
 ├── gating/   run*_gating.csv     ← \xFE/\xEF + Zaber position จาก GUI
 ├── video/    mu_video_*.mp4      ← scp จาก GUI
@@ -22,9 +22,33 @@ Layout ปลายทางบน server:
 
 ---
 
-## 1. `StdEventMonitor_fast.py` — raw → ROOT
+## 1. `StdEventMonitor_faster.cpp` (+ `build_monitor.sh`) — raw → ROOT (ตัวหลัก)
 
-แปลงไฟล์ EUDAQ `.raw` ไฟล์เดียวเป็น ROOT histogram แยกตาม plane (ขนานด้วย `mp.Pool`)
+C++ port ของ `StdEventMonitor_fast.py` — อ่าน raw ครั้งเดียว, trigger-sync
+reassignment สูตรเดียวกัน, เขียน ROOT object แท้ผ่าน TFile. output เป็น **superset**
+ของตัว Python: histogram เดิมครบ + เพิ่ม `EUDAQ Monitor/Hits vs TimeStamp`
+(bin 10 ms) และทั้ง dir `Alignment/` (Gaussian fit ต่อ sensor, beam center vs Z,
+linear fit, beam offset/angle ที่ collimator).
+
+```bash
+# build (auto: run_with_stats.py เรียกให้เองถ้า binary หาย/เก่ากว่า .cpp)
+bash build_monitor.sh              # หรือ --force
+# run
+./StdEventMonitor_faster <raw_file> [-o <output.root>]
+```
+
+`build_monitor.sh` ต้องการ C++17 compiler + ROOT (`root-config`) + EUDAQ2 build.
+ปรับ path ผ่าน env: `EUDAQ_PREFIX` (ดีฟอลต์ `/home/sutpct/eudaq2`), `EUDAQ_INC`,
+`EUDAQ_LIB`, `CXX`, หรือ `MONITOR_BUILD_CMD` (คำสั่ง compile เต็มๆ ถ้า auto-probe พลาด).
+
+⚠️ ค่าคงที่ geometry ใน `Alignment/` ฝังในโค้ด (`kFirstSensorZmm=112`, spacing 25 mm,
+pitch 0.02924/0.02688, collimator z=−60 mm) — ถ้าไม่ตรง setup KCMH กราฟ alignment
+จะมั่ว (histogram อื่นไม่กระทบ). compile flag `STDEVENTMONITOR_EUDAQ_COMPATIBLE`
+สลับไปโหมด collector-EventN + TProfile; **ดีฟอลต์ = trigger-sync = ตรงกับตัว Python**.
+
+## 2. `StdEventMonitor_fast.py` — raw → ROOT (fallback)
+
+ตัว Python เดิม (ขนานด้วย `mp.Pool`). ยังใช้เป็น fallback อัตโนมัติเมื่อ build C++ ไม่ผ่าน.
 
 ```bash
 ~/sutpct-env/bin/python3 StdEventMonitor_fast.py <raw_file> -o <output.root>
@@ -40,18 +64,19 @@ Layout ปลายทางบน server:
 ปกติ **ไม่ต้องเรียกตรง** — GUI สั่งผ่าน `run_with_stats.py` ให้อยู่แล้ว
 ถ้า log ขึ้น `No valid planes found` แปลว่ามี DAQ plane หลุดกลางรัน (ดู ITS3 Activity log)
 
-## 2. `run_with_stats.py` — wrapper ของข้อ 1 + เก็บสถิติ
+## 3. `run_with_stats.py` — wrapper ของข้อ 1/2 + เก็บสถิติ
 
-รัน `StdEventMonitor_fast.py` (ไฟล์เดียวกันในโฟลเดอร์นี้) แล้ว sample CPU/RAM/IO/GPU
-ของ process tree งานนี้ทุก 0.5 วิ ปริ้นลง stdout (ไปจบใน `log/`)
+เลือก monitor เอง: build + รัน `StdEventMonitor_faster` ถ้าได้, ไม่งั้น fall back ไป
+`StdEventMonitor_fast.py`. แล้ว sample CPU/RAM/IO/GPU ของ process tree งานนี้ทุก 0.5 วิ
+ปริ้นลง stdout (ไปจบใน `log/`). บรรทัด `Monitor :` ใน Run Stats บอกว่าตัวไหนรันจริง.
 
 ```bash
 ~/sutpct-env/bin/python3 run_with_stats.py <raw_file> -o <output.root>
 ```
 
-อาร์กิวเมนต์ส่งต่อให้ข้อ 1 ตรงๆ **นี่คือตัวที่ GUI เรียกอัตโนมัติหลังจบทุกรัน**
+อาร์กิวเมนต์ `<raw_file> -o <root>` ส่งต่อตรงๆ **นี่คือตัวที่ GUI เรียกอัตโนมัติหลังจบทุกรัน**
 
-## 3. `check_gating_consistency.py` — เช็ควินัยการ gate ฝั่ง DAQ
+## 4. `check_gating_consistency.py` — เช็ควินัยการ gate ฝั่ง DAQ
 
 เทียบจำนวน event ที่บันทึกจริง (จาก `log/`) กับ 2 การทำนาย:
 - gate ไม่มีผล: `trigger_freq_hz × ระยะเวลารันทั้งหมด`
@@ -72,7 +97,7 @@ Layout ปลายทางบน server:
 ⚠️ ตรวจแค่วินัยการ gate ฝั่ง DAQ **ไม่ใช่ตัวจับบีมปลิ้น** — ALPIDE มองไม่เห็นอะไรตอน ungated
 อยู่แล้วไม่ว่าจะมีบีมหรือไม่
 
-## 4. `ocr_video.py` — OCR วิดีโอ MU (ใช้ GPU)
+## 5. `ocr_video.py` — OCR วิดีโอ MU (ใช้ GPU)
 
 อ่านตัวเลข MU1/MU2/rate/progress จาก `mu_video_*.mp4` (ROI 4 แถบซ้อนกัน แถบละ 80px)
 ด้วย EasyOCR + validate ช่วงค่า + `_MuPairFilter` (กันค่าสะสมลด/เด้ง)

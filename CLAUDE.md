@@ -37,17 +37,20 @@ The end-user operating manual is `docs/MANUAL.txt`.
 
 ## Data Processing Scripts
 
-All scripts that run **on the remote server** live in `remote_scripts/`. On rsync connect, `RsyncManager` ships every `*.py` and `*.md` in that folder to `<remote_path>/scripts/` — so adding a new server-side script means dropping it in `remote_scripts/`, nothing else. `remote_scripts/README.md` documents every script's CLI and ships with them.
+All scripts that run **on the remote server** live in `remote_scripts/`. On rsync connect, `RsyncManager` ships every `*.py`, `*.md`, `*.cpp` and `*.sh` in that folder to `<remote_path>/scripts/` — so adding a new server-side script means dropping it in `remote_scripts/`, nothing else. `remote_scripts/README.md` documents every script's CLI and ships with them.
 
 ```bash
-# Convert a raw EUDAQ file to ROOT (run on remote server via SSH)
-python3 remote_scripts/StdEventMonitor_fast.py <raw_file> -o <output.root>
-
-# Same, with per-job CPU/RAM/disk/GPU stats logged to stdout
+# Convert a raw EUDAQ file to ROOT, with per-job CPU/RAM/disk/GPU stats to stdout
 python3 remote_scripts/run_with_stats.py <raw_file> -o <output.root>
 ```
 
-`run_with_stats.py` is a wrapper that spawns `StdEventMonitor_fast.py` as a subprocess (same dir) and samples `psutil` metrics every 0.5 s. The UI triggers this remotely via SSH after each run. `check_gating_consistency.py` and `ocr_video.py` are also in `remote_scripts/` and run server-side only.
+**raw → ROOT: two monitors, one wrapper.**
+- `StdEventMonitor_faster.cpp` is the primary converter — a C++ port of the Python monitor (same single-pass read + trigger-sync event reassignment), linked against ROOT + EUDAQ, writing native ROOT objects. Its output is a **superset** of the Python one: same histograms plus `EUDAQ Monitor/Hits vs TimeStamp` (10 ms bins) and an `Alignment/` dir (per-sensor Gaussian fits, beam center vs Z, linear fit, beam offset/angle at the collimator). Geometry constants (`kFirstSensorZmm=112`, spacing 25 mm, pitch, collimator z=−60 mm) are hardcoded — verify against the real KCMH setup or the `Alignment/` plots are meaningless (other histograms unaffected). Compile flag `STDEVENTMONITOR_EUDAQ_COMPATIBLE` switches to collector-EventN + TProfile mode; **default build = trigger-sync = matches the Python monitor.**
+- `build_monitor.sh` compiles it server-side (needs C++17 + ROOT + an EUDAQ2 build). Auto-probes `EUDAQ_PREFIX` (default `/home/sutpct/eudaq2`); override with `EUDAQ_INC` / `EUDAQ_LIB` / `ROOT_CONFIG` / `CXX`, or `MONITOR_BUILD_CMD` for a verbatim compile line. **Two-ROOT gotcha:** the KCMH server has ROOT at both `/usr/lib64/root` and `/home/sutpct/root`; EUDAQ core is linked to the latter. Building against the wrong one loads two `libCore` into the process and its static teardown corrupts the heap (`munmap_chunk … in _dl_fini`, exit 134) *after* the ROOT file is already written. `build_monitor.sh` avoids this by reading `ldd libeudaq_core.so` and building against the ROOT EUDAQ actually uses. Belt-and-suspenders: the `.cpp` calls `std::_Exit()` once the file is closed, skipping global destructors entirely.
+- `StdEventMonitor_fast.py` is the fallback — the original Python monitor (`mp.Pool` per plane), still shipped.
+- `run_with_stats.py` is the wrapper the UI SSH-triggers after every run. It rebuilds the C++ binary if the source is newer (`build_monitor.sh`), runs it, and **falls back to `StdEventMonitor_fast.py` if the source/toolchain is missing or the build fails** — runs never break. It samples `psutil` metrics for the job's process tree every 0.5 s; the `Monitor :` line in the Run Stats block records which one actually ran.
+
+`check_gating_consistency.py` and `ocr_video.py` are also in `remote_scripts/` and run server-side only.
 
 ## Architecture
 
