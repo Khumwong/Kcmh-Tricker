@@ -245,6 +245,10 @@ class MyWindow(QMainWindow):
                     _real_speeds  = _sim._originals.get('motion.get_max_speeds')
                     if _real_connect and _real_get_loc:
                         conn = _real_connect(get_port("zaber"))
+                        try:
+                            motion.ensure_maxspeed(conn)
+                        except Exception:
+                            pass
                         loc = _real_get_loc(conn)
                         if "_run_widget" in self.__dict__:
                             self._run_widget.set_ph_loc_full(["{:.2f}".format(l) for l in loc])
@@ -255,6 +259,10 @@ class MyWindow(QMainWindow):
                 except Exception:
                     pass
             conn = zaber_connect.connect(get_port("zaber"))
+            try:
+                motion.ensure_maxspeed(conn)   # pin the speed ceiling (X/Y 40 mm/s, R 80 °/s)
+            except Exception:
+                pass
             loc = motion.get_current_locations(conn)
             try:
                 self._zaber_max_speeds = motion.get_max_speeds(conn)

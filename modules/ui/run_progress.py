@@ -335,11 +335,18 @@ class RunProgress(QObject):
         self._run_btn.setEnabled(False)
         self.start_with_thread()
 
+    def _window_ms_per_loop(self):
+        """Gate-open time per loop (ms) = Beam delay (beam turn-on lag) + Exposure
+        + Beam off delay (trigger stays running past exposure so ALPIDE can confirm
+        the beam is gone before the gate closes and the phantom steps)."""
+        le = self._window._line_edits
+        return (float(le["Beam delay (ms)"].text() or 0) +
+                float(le["Exposure time (ms)"].text() or 0) +
+                float(le["Beam off delay (ms)"].text() or 0))
+
     def start_with_thread(self):
         self._num_step_loops = int(self._window._line_edits["Loops"].text())
-        expose_time = (float(self._window._line_edits["Exposure time (ms)"].text()) +
-                       float(self._window._line_edits["Beam delay (ms)"].text())
-                       )*int(self._window._line_edits["Loops"].text())*1e-3
+        expose_time = self._window_ms_per_loop() * int(self._window._line_edits["Loops"].text()) * 1e-3
         time_step = expose_time/self._num_step_loops
         time_prog_size = expose_time/(1000)
         _qa_mode = getattr(getattr(self._window, '_window', None), '_qa_mode', False)
@@ -359,7 +366,10 @@ class RunProgress(QObject):
                 float(self._window._ph_y_label.text()),
                 float(self._window._ph_r_label.text())
             ]
-            self._zaber_velocities = None  # Treatment mode ใช้ max speed เสมอ
+            # Treatment per-loop step speed: always the Speed fields, clamped to
+            # [SPEED_FLOOR, SPEED_CEIL] per axis (never 0 / bare max-speed).
+            self._zaber_velocities = list(self._window._current_move_speeds())
+            _rp_log(f"Treatment step speed: {self._zaber_velocities}")
         self._progress_bar.setFormat("0/{}".format(self._num_step_loops))
         self._event_loop = asyncio.get_event_loop()
 
@@ -411,9 +421,7 @@ class RunProgress(QObject):
                 self._window._mu_tracker.start()
         except Exception as e:
             _rp_log(f"MuTracker start error: {e}")
-        expose_time = (float(self._window._line_edits["Exposure time (ms)"].text()) +
-                       float(self._window._line_edits["Beam delay (ms)"].text())
-                       ) * int(self._window._line_edits["Loops"].text()) * 1e-3
+        expose_time = self._window_ms_per_loop() * int(self._window._line_edits["Loops"].text()) * 1e-3
         # QA mode: one continuous acquisition window (never chopped into Loops
         # sub-windows, so the beam gate opens once and the step sound plays once).
         #   - velocity sweep -> ends when the stage reaches target (force_stop

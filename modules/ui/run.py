@@ -260,6 +260,7 @@ class RunWidget(QWidget):
             "current": QLineEdit(),
             "Exposure time (ms)": QLineEdit(),
             "Beam delay (ms)": QLineEdit(),
+            "Beam off delay (ms)": QLineEdit(),
             "Loops": QLineEdit(),
             "Trigger Freq. (Hz)": QLineEdit(),
             "X step (mm)": QLineEdit(),
@@ -270,7 +271,8 @@ class RunWidget(QWidget):
         _field_defaults = {
             "num_alpides": "6", "num_events": "30000", "strobe": "100",
             "ithr": "60", "energy": "200", "MU": "1000", "current": "10",
-            "Exposure time (ms)": "1000", "Beam delay (ms)": "200", "Loops": "1",
+            "Exposure time (ms)": "1000", "Beam delay (ms)": "200",
+            "Beam off delay (ms)": "200", "Loops": "1",
             "Trigger Freq. (Hz)": "9500", "X step (mm)": "0",
             "Y step (mm)": "0", "R step (degree)": "0",
         }
@@ -284,6 +286,9 @@ class RunWidget(QWidget):
             "current": "The current used for KCMH beam: 4 - 300",
             "Exposure time (ms)": "The total exposure time used for the test: 1 - 100000",
             "Beam delay (ms)": "The delay beam hit event between phantom translations: 0 - 255",
+            "Beam off delay (ms)": ("Keep the trigger running this long AFTER exposure ends, "
+                                    "before closing the gate and moving the phantom — lets ALPIDE "
+                                    "confirm the beam is gone. GUI-side window only: 0 - 100000"),
             "Loops": "The loop of radiation: must be less than exposure time",
             "Trigger Freq. (Hz)": "The trigger frequency: 1 - 95000",
             "X step (mm)": "Stage X step per loop (mm) — max 150 mm",
@@ -293,6 +298,15 @@ class RunWidget(QWidget):
         # โหลดค่าล่าสุดจาก config ถ้ามี
         _saved_fields = self._config.get('fields', {})
         _saved_qa = self._config.get('qa_pos', {})
+        # Speed fields are one set of widgets shared by QA (sweep speed toward
+        # Target) and Treatment (per-loop step speed), but the two persist
+        # separately — _set_qa_mode() swaps the widget contents on mode change so
+        # a QA sweep speed never leaks into a Treatment step and vice versa.
+        _saved_trt_speed = self._config.get('trt_speed', {})
+        self._speed_store = {
+            'qa':  [_saved_qa.get('vel_x', '0'),          _saved_qa.get('vel_y', '0'),          _saved_qa.get('vel_r', '0')],
+            'trt': [_saved_trt_speed.get('vel_x', '2.5'), _saved_trt_speed.get('vel_y', '2.5'), _saved_trt_speed.get('vel_r', '6')],
+        }
         for k, v in self._line_edits.items():
             v.setText(_saved_fields.get(k, _field_defaults.get(k, "")))
             if _field_tooltips.get(k):
@@ -331,11 +345,16 @@ class RunWidget(QWidget):
         # ── Notification history ─────────────────────────────────────────
         self._notif = NotificationPanel(parent_widget=self)
         self.init_ui()
-        # velocity fields ใช้เฉพาะ QA mode — disabled ตั้งแต่แรก (default = Treatment)
-        for edit in [self._vel_x_edit, self._vel_y_edit, self._vel_r_edit]:
-            edit.setEnabled(False)
-        if self._window._sim_mode:
-            self.set_zaber_max_speeds((2.54, 2.44, 6.0))
+        # Speed fields serve both modes (QA sweep speed / Treatment step speed) —
+        # _set_qa_mode() keeps them enabled and refreshes their tooltip per mode.
+        for _i, edit in enumerate((self._vel_x_edit, self._vel_y_edit, self._vel_r_edit)):
+            edit.setEnabled(True)
+            edit.editingFinished.connect(lambda i=_i: self._validate_speed_field(i))
+            edit.editingFinished.connect(self._save_fields)
+        for edit in (self._qa_pos_x_edit, self._qa_pos_y_edit, self._qa_pos_r_edit):
+            edit.setEnabled(True)
+            edit.editingFinished.connect(self._save_fields)
+        self.set_zaber_max_speeds(None)   # paint the default/max label
         # poll device status ทุก 2 วินาที
         self._firmware_timer = QTimer(self)
         self._firmware_timer.setInterval(2000)
@@ -685,12 +704,12 @@ class RunWidget(QWidget):
         self._qa_pos_x_edit.setToolTip("Target X position (mm) — max 150 mm")
         self._qa_pos_y_edit.setToolTip("Target Y position (mm) — max 40 mm")
         self._qa_pos_r_edit.setToolTip("Target R position (°) — max 360°")
-        self._vel_x_edit = QLineEdit("0")
-        self._vel_y_edit = QLineEdit("0")
-        self._vel_r_edit = QLineEdit("0")
-        self._vel_x_edit.setToolTip("Speed X (mm/s) — max 2.5 mm/s\n0 = axis does not move")
-        self._vel_y_edit.setToolTip("Speed Y (mm/s) — max 2.5 mm/s\n0 = axis does not move")
-        self._vel_r_edit.setToolTip("Speed R (°/s) — max 6.0 °/s\n0 = axis does not move")
+        self._vel_x_edit = QLineEdit("2.5")
+        self._vel_y_edit = QLineEdit("2.5")
+        self._vel_r_edit = QLineEdit("6.0")
+        self._vel_x_edit.setToolTip("Move speed X — 2.5 to 40 mm/s")
+        self._vel_y_edit.setToolTip("Move speed Y — 2.5 to 40 mm/s")
+        self._vel_r_edit.setToolTip("Move speed R — 6 to 80 °/s")
 
         sv_axes = [
             ("X", self._line_edits["X step (mm)"],     "mm",
@@ -730,13 +749,11 @@ class RunWidget(QWidget):
             "QLabel { font-size: 10px; color: #4a6078; border: none; }")
         ph_inner_layout.addWidget(self._vel_limit_label)
 
-        # apply saved QA position/speed values now that fields exist
+        # apply saved QA target positions now that fields exist (speed fields are
+        # filled by _set_qa_mode from self._speed_store per active mode)
         for edit, key in [(self._qa_pos_x_edit, 'qa_pos_x'),
                           (self._qa_pos_y_edit, 'qa_pos_y'),
-                          (self._qa_pos_r_edit, 'qa_pos_r'),
-                          (self._vel_x_edit,    'vel_x'),
-                          (self._vel_y_edit,    'vel_y'),
-                          (self._vel_r_edit,    'vel_r')]:
+                          (self._qa_pos_r_edit, 'qa_pos_r')]:
             if self._saved_qa_config.get(key, "") != "":
                 edit.setText(self._saved_qa_config[key])
         ph_inner_layout.addSpacing(2)
@@ -857,9 +874,10 @@ class RunWidget(QWidget):
         ctrl_grid.setAlignment(Qt.AlignmentFlag.AlignTop)
 
         ctrl_fields = [
-            ("Exposure time (ms)", "Exposure time (ms)"),
-            ("Beam delay (ms)",    "Beam delay (ms)"),
-            ("Loops",              "Loops"),
+            ("Exposure time (ms)",  "Exposure time (ms)"),
+            ("Beam delay (ms)",     "Beam delay (ms)"),
+            ("Beam off delay (ms)", "Beam off delay (ms)"),
+            ("Loops",               "Loops"),
             ("Energy (MeV)",       "energy"),
             ("MU",                 "MU"),
             ("Current (nA)",       "current"),
@@ -1350,6 +1368,11 @@ class RunWidget(QWidget):
                 edit.setText(row_data[key])
             else:
                 edit.setText(_blank)
+        # clamp the speed fields into the active-mode band, then sync the store
+        for _i in range(3):
+            self._validate_speed_field(_i)
+        self._speed_store['qa' if self._window._qa_mode else 'trt'] = [
+            self._vel_x_edit.text(), self._vel_y_edit.text(), self._vel_r_edit.text()]
 
         # set phantom go-to inputs
         sx = row_data.get("start_x", "0")
@@ -1380,7 +1403,8 @@ class RunWidget(QWidget):
             try:
                 conn = zaber_connect.connect(get_port("zaber"))
                 dlg.set_conn(conn)
-                motion.apply_move(conn, (float(sx), float(sy), float(sr)))
+                motion.apply_move(conn, (float(sx), float(sy), float(sr)),
+                                  self._current_move_speeds())
                 loc = motion.get_current_locations(conn)
                 dlg._sig_move_done.emit(float(loc[0]), float(loc[1]), float(loc[2]))
             except Exception as exc:
@@ -1465,6 +1489,19 @@ class RunWidget(QWidget):
     # ------------------------------------------------------------------ #
     #  Phantom control methods                                             #
     # ------------------------------------------------------------------ #
+    def _current_move_speeds(self):
+        """(vx, vy, vr) from the Speed fields, clamped to [SPEED_FLOOR, SPEED_CEIL]
+        per axis. Never 0 / blank / below floor — every move has a real speed."""
+        flr, ceil = motion.SPEED_FLOOR, motion.SPEED_CEIL
+        out = []
+        for i, edit in enumerate((self._vel_x_edit, self._vel_y_edit, self._vel_r_edit)):
+            try:
+                s = float(edit.text())
+            except (ValueError, TypeError):
+                s = flr[i]
+            out.append(min(max(s, flr[i]), ceil[i]))
+        return tuple(out)
+
     def _ph_step(self, axis, direction):
         step_edits = [self._x_step_edit, self._y_step_edit, self._r_step_edit]
         pos_edits  = [self._ph_x_edit_ctrl, self._ph_y_edit_ctrl, self._ph_r_edit_ctrl]
@@ -1479,7 +1516,7 @@ class RunWidget(QWidget):
                                             ["X", "Y", "R"][axis] + " axis is at limit.")
                     return
             conn = zaber_connect.connect(get_port("zaber"))
-            motion.apply_step(conn, axis, direction * step)
+            motion.apply_step(conn, axis, direction * step, self._current_move_speeds()[axis])
             loc = motion.get_current_locations(conn)
             conn.close()
             self.set_ph_loc_full(["{:.2f}".format(l) for l in loc])
@@ -1513,7 +1550,8 @@ class RunWidget(QWidget):
             try:
                 conn = zaber_connect.connect(get_port("zaber"))
                 dlg.set_conn(conn)
-                motion.apply_move(conn, (float(_x), float(_y), float(_r)))
+                motion.apply_move(conn, (float(_x), float(_y), float(_r)),
+                                  self._current_move_speeds())
                 loc = motion.get_current_locations(conn)
                 dlg._sig_move_done.emit(float(loc[0]), float(loc[1]), float(loc[2]))
             except Exception as e:
@@ -1615,7 +1653,7 @@ class RunWidget(QWidget):
         if not self._window._zaber_connect:
             return
 
-        _MAX_VX, _MAX_VY, _MAX_VR = 2.5, 2.5, 6.0
+        _MAX_VX, _MAX_VY, _MAX_VR = motion.SPEED_CEIL
         over = []
         if sx > _MAX_VX: over.append(f"X: {sx} mm/s  (max {_MAX_VX} mm/s)")
         if sy > _MAX_VY: over.append(f"Y: {sy} mm/s  (max {_MAX_VY} mm/s)")
@@ -1720,18 +1758,33 @@ class RunWidget(QWidget):
             self._ph_apply_btn.setEnabled(False)
 
     def set_zaber_max_speeds(self, speeds):
-        """speeds = (max_vx mm/s, max_vy mm/s, max_vr °/s)"""
-        self._zaber_max_speeds = speeds
-        if hasattr(self, '_vel_limit_label') and speeds:
-            mx, my, mr = speeds
+        """`speeds` (the live device maxspeed, or None) is kept for reference; the
+        Speed fields are bounded by the fixed motion.SPEED_FLOOR / SPEED_CEIL."""
+        if speeds:
+            self._zaber_max_speeds = speeds
+        flr, ceil = motion.SPEED_FLOOR, motion.SPEED_CEIL
+        if hasattr(self, '_vel_limit_label'):
             self._vel_limit_label.setText(
-                f"max speed: {mx:.1f} mm/s  {my:.1f} mm/s  {mr:.1f} °/s")
-            for edit, val in [(self._vel_x_edit, mx),
-                              (self._vel_y_edit, my),
-                              (self._vel_r_edit, mr)]:
-                if not edit.text() or float(edit.text() or 0) == 0:
-                    safe = int(val * 100) / 100
-                    edit.setText(f"{safe:.2f}")
+                f"default {flr[0]:g} / {flr[1]:g} / {flr[2]:g}   ·   "
+                f"max {ceil[0]:g} / {ceil[1]:g} / {ceil[2]:g}   (mm/s, mm/s, °/s)")
+        # clamp any out-of-range Speed field into the allowed band
+        for i in range(3):
+            self._validate_speed_field(i)
+
+    def _validate_speed_field(self, idx):
+        """Clamp Speed field `idx` into its band. Treatment: [FLOOR, CEIL] — never
+        below the gentle default. QA: [0, CEIL] — 0 still means 'axis does not move'."""
+        edit = (self._vel_x_edit, self._vel_y_edit, self._vel_r_edit)[idx]
+        ceil = motion.SPEED_CEIL[idx]
+        lo = 0.0 if getattr(self._window, '_qa_mode', False) else motion.SPEED_FLOOR[idx]
+        try:
+            v = float(edit.text())
+        except (ValueError, TypeError):
+            v = lo
+        v = min(max(v, lo), ceil)
+        txt = f"{v:g}"
+        if edit.text() != txt:
+            edit.setText(txt)
 
     def set_ph_loc_full(self, loc):
         """อัพเดต Current position labels เท่านั้น — ไม่แตะ Go to inputs"""
@@ -2060,7 +2113,7 @@ class RunWidget(QWidget):
         _le = self._line_edits
         print(f"[LAUNCH] {datetime.now().strftime('%H:%M:%S.%f')[:-3]}")
         print(f"  mode={'QA' if self._window._qa_mode else 'Treatment'}")
-        for _k in ["Exposure time (ms)", "Beam delay (ms)", "Loops", "energy", "MU",
+        for _k in ["Exposure time (ms)", "Beam delay (ms)", "Beam off delay (ms)", "Loops", "energy", "MU",
                    "current", "num_alpides", "num_events", "strobe", "ithr"]:
             if _k in _le:
                 print(f"  {_k}={_le[_k].text()}")
@@ -2223,6 +2276,7 @@ class RunWidget(QWidget):
                 _ctrl_fields = [
                     ("Exposure time (ms)", _le.get("Exposure time (ms)", None)),
                     ("Beam delay (ms)",    _le.get("Beam delay (ms)", None)),
+                    ("Beam off delay (ms)", _le.get("Beam off delay (ms)", None)),
                     ("Loops",             _le.get("Loops", None)),
                     ("Trigger Freq. (Hz)",_le.get("Trigger Freq. (Hz)", None)),
                     ("X step (mm)",       _le.get("X step (mm)", None)),
@@ -2239,6 +2293,10 @@ class RunWidget(QWidget):
                     ("Current (nA)", _le.get("current", None)),
                 ]
                 def _fv(w): return w.text() if w is not None else "-"
+
+                _sp = self._current_move_speeds()
+                _speed_line = (f"  {'Move speed':<20}: "
+                               f"X={_sp[0]:g} mm/s  Y={_sp[1]:g} mm/s  R={_sp[2]:g} °/s\n")
 
                 # QA sweep block — records mode, sweep target/speed, and start->end
                 # position so a QA run can be correlated with stage position offline
@@ -2272,7 +2330,8 @@ class RunWidget(QWidget):
                     f"  R         : {self._ph_r_label.text()} deg\n"
                     + _qa_block +
                     f"\n--- Controller ---\n"
-                    + "".join(f"  {k:<20}: {_fv(w)}\n" for k, w in _ctrl_fields) +
+                    + "".join(f"  {k:<20}: {_fv(w)}\n" for k, w in _ctrl_fields)
+                    + _speed_line +
                     f"\n--- EUDAQ ---\n"
                     + "".join(f"  {k:<20}: {_fv(w)}\n" for k, w in _eudaq_fields) +
                     f"\n--- Run Stats ---\n"
@@ -2559,6 +2618,7 @@ class RunWidget(QWidget):
         self._update_firmware_label()
 
     def _set_qa_mode(self, qa: bool):
+        _prev_qa = getattr(self._window, '_qa_mode', None)
         self._window._qa_mode = qa
         self._mode_treatment_btn.setStyleSheet(self._pill_inactive_style if qa else self._pill_active_style)
         self._mode_qa_btn.setStyleSheet(self._pill_active_style if qa else self._pill_inactive_style)
@@ -2566,14 +2626,35 @@ class RunWidget(QWidget):
         self._kill_beam_btn.setEnabled(not qa)
         self._beam_ctrl_inner.setEnabled(not qa)
         self._launch_eudaq_default.setEnabled(qa)
-        for edit in [self._qa_pos_x_edit, self._qa_pos_y_edit, self._qa_pos_r_edit,
-                     self._vel_x_edit, self._vel_y_edit, self._vel_r_edit]:
+        # Target position is QA-only; Speed serves both modes (QA sweep speed /
+        # Treatment step-Apply-jog speed) and is clamped per _validate_speed_field.
+        for edit in [self._qa_pos_x_edit, self._qa_pos_y_edit, self._qa_pos_r_edit]:
             edit.setEnabled(qa)
             edit.setVisible(qa)
+        for edit in [self._vel_x_edit, self._vel_y_edit, self._vel_r_edit]:
+            edit.setEnabled(True)
+            edit.setVisible(True)
+        _vel_tip = ("Sweep speed toward Target — 0 = axis stays still.\n"
+                    "Also used by Apply / jog. Range 0–40 mm/s (R 0–80 °/s)."
+                    if qa else
+                    "Move speed — used by Apply, jog, and the per-loop step.\n"
+                    "Range 2.5–40 mm/s (R 6–80 °/s), clamped to that band.")
+        self._vel_x_edit.setToolTip(_vel_tip)
+        self._vel_y_edit.setToolTip(_vel_tip)
+        self._vel_r_edit.setToolTip(_vel_tip)
+        # swap the shared Speed widgets between the QA and Treatment stores
+        if _prev_qa is not None and _prev_qa != qa:
+            self._speed_store['qa' if _prev_qa else 'trt'] = [
+                self._vel_x_edit.text(), self._vel_y_edit.text(), self._vel_r_edit.text()]
+        for _e, _v in zip((self._vel_x_edit, self._vel_y_edit, self._vel_r_edit),
+                          self._speed_store['qa' if qa else 'trt']):
+            _e.setText(_v)
+        for _i in range(3):
+            self._validate_speed_field(_i)
         for w in self._qa_col_widgets:
             w.setVisible(qa)
         # ซ่อนตัวเลขที่ไม่เกี่ยวใน QA mode
-        for key in ["Exposure time (ms)", "Beam delay (ms)", "Loops",
+        for key in ["Exposure time (ms)", "Beam delay (ms)", "Beam off delay (ms)", "Loops",
                     "energy", "MU", "current",
                     "X step (mm)", "Y step (mm)", "R step (degree)"]:
             self._line_edits[key].setVisible(not qa)
@@ -2772,15 +2853,24 @@ class RunWidget(QWidget):
 
     def _save_fields(self):
         """บันทึกค่า field ทั้งหมดลง config.json"""
+        # fold the live Speed widgets into the active-mode store first
+        _active = 'qa' if getattr(self._window, '_qa_mode', False) else 'trt'
+        self._speed_store[_active] = [
+            self._vel_x_edit.text(), self._vel_y_edit.text(), self._vel_r_edit.text()]
         try:
             self._config.set('fields', {k: v.text() for k, v in self._line_edits.items()})
             self._config.set('qa_pos', {
                 'qa_pos_x': self._qa_pos_x_edit.text(),
                 'qa_pos_y': self._qa_pos_y_edit.text(),
                 'qa_pos_r': self._qa_pos_r_edit.text(),
-                'vel_x': self._vel_x_edit.text(),
-                'vel_y': self._vel_y_edit.text(),
-                'vel_r': self._vel_r_edit.text(),
+                'vel_x': self._speed_store['qa'][0],
+                'vel_y': self._speed_store['qa'][1],
+                'vel_r': self._speed_store['qa'][2],
+            })
+            self._config.set('trt_speed', {
+                'vel_x': self._speed_store['trt'][0],
+                'vel_y': self._speed_store['trt'][1],
+                'vel_r': self._speed_store['trt'][2],
             })
             self._config.save()
         except Exception:
@@ -2828,6 +2918,7 @@ class RunWidget(QWidget):
             "current": ["current", list(range(4, 300))],
             "Exposure time (ms)": ["exposure time", list(range(1, 100_000))],
             "Beam delay (ms)": ["beam dalay", list(range(0, 256))],
+            "Beam off delay (ms)": ["beam off delay", list(range(0, 100_000))],
             "Loops": ["number of loops", list(range(1, 100))],
             "Trigger Freq. (Hz)": ["trigger frequency", list(range(1, 99001))],
             "X step (mm)": ["X step length", [-float(self._window.orig_loc[0]), 150 - float(self._window.orig_loc[0])]],

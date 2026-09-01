@@ -106,13 +106,24 @@
 
   ─── Controller Settings ───
 
-  Exposure time (ms)   → เวลาต่อ 1 loop  (1–100000)
-  Beam delay (ms)      → หน่วงเวลาก่อน trigger  (0–255)
+  Exposure time (ms)   → เวลาเก็บข้อมูลต่อ 1 loop  (1–100000)
+  Beam delay (ms)      → หน่วงเวลาก่อน trigger / เผื่อบีมมาช้า  (0–255)
+  Beam off delay (ms)  → หลัง exposure จบ ยังเปิด trigger ค้างต่ออีกเท่านี้
+                         ก่อนปิด gate แล้วเลื่อน phantom — เผื่อบีมยังไม่ดับสนิท
+                         (0–100000, GUI เท่านั้น ไม่ส่งไป FPGA)
   Loops                → จำนวนรอบ (ต้องน้อยกว่า Exposure time)
   Trigger Freq. (Hz)   → ความถี่ readout ALPIDE  (1–95000)
   X step (mm)          → ระยะเลื่อนแกน X ต่อ loop
   Y step (mm)          → ระยะเลื่อนแกน Y ต่อ loop
   R step (°)           → มุมหมุนต่อ loop
+
+  Speed X/Y/R (ในการ์ด Zaber ช่อง "Speed")
+                       → ความเร็วตอน step ต่อ loop + ปุ่ม Apply + jog
+                         ใส่ค่าเท่าไร ขยับเท่านั้นจริง (Apply เช็คก่อน run ได้)
+                         ช่วง X 2.5–40, Y 2.5–40 mm/s, R 6–80 °/s
+                         ต่ำกว่า floor / เกิน max โดน clamp เข้าช่วง
+                         ตัวเลขสีเทาใต้ช่อง = default (ค่าต่ำสุด) · max
+                         QA: ช่องเดียวกันนี้ = sweep speed, 0 = แกนไม่ขยับ
 
   ☐ Enable             → เปิดใช้ KCMH proton beam
                          (ต้องต่ออุปกรณ์ครบ + ตั้ง rsync ก่อน)

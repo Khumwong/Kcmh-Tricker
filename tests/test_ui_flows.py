@@ -49,12 +49,16 @@ def qa_mode_enables_velocity():
     rw._set_qa_mode(True)
     assert win._qa_mode is True
     assert rw._vel_x_edit.isEnabled(), "vel_x should be enabled in QA"
+    assert not rw._qa_pos_x_edit.isHidden(), "Target field should show in QA"
     assert rw._launch_eudaq_default.isEnabled(), "Launch enabled in QA without Enable checkbox"
 
-def treatment_mode_disables_velocity():
+def treatment_mode_speed_field_stays_usable():
+    # Speed fields now serve Treatment too (per-loop step speed); only the
+    # Target (QA position) field is QA-only.
     rw._set_qa_mode(False)
     assert win._qa_mode is False
-    assert not rw._vel_x_edit.isEnabled(), "vel_x should be disabled in Treatment"
+    assert rw._vel_x_edit.isEnabled(), "vel_x should stay enabled in Treatment"
+    assert rw._qa_pos_x_edit.isHidden(), "Target field should hide in Treatment"
 
 def treatment_launch_needs_enable():
     rw._set_qa_mode(False)
@@ -63,7 +67,7 @@ def treatment_launch_needs_enable():
     assert rw._enable_checkbox.isChecked() is False
 
 check("QA mode enables velocity fields + Launch", qa_mode_enables_velocity)
-check("Treatment mode disables velocity fields", treatment_mode_disables_velocity)
+check("Treatment keeps speed field, hides Target", treatment_mode_speed_field_stays_usable)
 check("Treatment Launch gated on Enable checkbox", treatment_launch_needs_enable)
 
 # ── speed limit guard (logic only, no motion) ────────────────────────────────

@@ -6,6 +6,35 @@ X_MAX = 150.0 #mm
 Y_MAX = 40.0 #mm
 R_MAX = 360 #mm
 
+# Move-speed bounds (X mm/s, Y mm/s, R deg/s). FLOOR = the old gentle default
+# (moves are never slower than this); CEIL = the speed the app pins each axis'
+# `maxspeed` setting to on connect, well under the datasheet max (53/48/115°).
+# Actual per-move speed is always the Speed field value, clamped to [FLOOR, CEIL]
+# and passed as a per-move velocity override.
+SPEED_FLOOR = (2.5, 2.5, 6.0)
+SPEED_CEIL  = (40.0, 40.0, 80.0)
+
+_SPEED_UNITS = (
+    zaber_units.Units.VELOCITY_MILLIMETRES_PER_SECOND,
+    zaber_units.Units.VELOCITY_MILLIMETRES_PER_SECOND,
+    zaber_units.Units.ANGULAR_VELOCITY_DEGREES_PER_SECOND,
+)
+
+
+def ensure_maxspeed(conn: Connection, speeds=SPEED_CEIL):
+    """Pin each axis' `maxspeed` setting to `speeds` so the app's speed ceiling is
+    deterministic regardless of prior Zaber Launcher edits or a controller reset.
+    Per-move velocity overrides still control the actual speed of each move."""
+    for i, dev_id in enumerate((1, 2, 3)):
+        try:
+            dev = conn.get_device(dev_id); dev.identify()
+            ax = dev.get_axis(1)
+            cur = ax.settings.get("maxspeed", unit=_SPEED_UNITS[i])
+            if abs(cur - speeds[i]) > 0.05:
+                ax.settings.set("maxspeed", speeds[i], unit=_SPEED_UNITS[i])
+        except Exception:
+            pass
+
 def poll_positions(conn: Connection):
     """Lightweight position read for real-time polling — no identify() call."""
     return (
@@ -50,7 +79,11 @@ def to_home(conn: Connection):
         )
     asyncio.run(_run())
     
-def apply_move(conn, loc):
+def apply_move(conn, loc, speeds=None):
+    """Absolute move on all three axes. speeds = (vx mm/s, vy mm/s, vr deg/s);
+    0 / None / missing on an axis = that axis moves at its max speed (unchanged
+    behaviour). A value is passed as a per-move velocity override (firmware still
+    clamps it to the axis maxspeed)."""
     device_x = conn.get_device(1)
     device_x.identify()
     # print(device_x.name)
@@ -61,19 +94,37 @@ def apply_move(conn, loc):
 
     device_rot = conn.get_device(3)
     device_rot.identify()
-    
+
+    speeds = speeds or (0, 0, 0)
+
+    def _kw(unit, vunit, s):
+        kw = dict(unit=unit)
+        if s and s > 0:
+            kw['velocity'] = s
+            kw['velocity_unit'] = vunit
+        return kw
+
     async def _run():
         await asyncio.gather(
-            device_x.get_axis(1).move_absolute_async(loc[0], unit=zaber_units.Units.LENGTH_MILLIMETRES),
-            device_y.get_axis(1).move_absolute_async(loc[1], unit=zaber_units.Units.LENGTH_MILLIMETRES),
-            device_rot.get_axis(1).move_absolute_async(loc[2], unit=zaber_units.Units.ANGLE_DEGREES),
+            device_x.get_axis(1).move_absolute_async(
+                loc[0], **_kw(zaber_units.Units.LENGTH_MILLIMETRES,
+                              zaber_units.Units.VELOCITY_MILLIMETRES_PER_SECOND, speeds[0])),
+            device_y.get_axis(1).move_absolute_async(
+                loc[1], **_kw(zaber_units.Units.LENGTH_MILLIMETRES,
+                              zaber_units.Units.VELOCITY_MILLIMETRES_PER_SECOND, speeds[1])),
+            device_rot.get_axis(1).move_absolute_async(
+                loc[2], **_kw(zaber_units.Units.ANGLE_DEGREES,
+                              zaber_units.Units.ANGULAR_VELOCITY_DEGREES_PER_SECOND, speeds[2])),
         )
     asyncio.run(_run())
     return (device_x.get_axis(1).get_position(unit=zaber_units.Units.LENGTH_MILLIMETRES),
             device_y.get_axis(1).get_position(unit=zaber_units.Units.LENGTH_MILLIMETRES),
             device_rot.get_axis(1).get_position(unit=zaber_units.Units.ANGLE_DEGREES))
     
-def apply_step(conn: Connection, axis, step):
+def apply_step(conn: Connection, axis, step, speed=None):
+    """Relative jog on one axis (0=X, 1=Y, 2=R). speed = mm/s or deg/s;
+    0 / None = move at max speed. A value is a per-move velocity override
+    (firmware clamps to the axis maxspeed)."""
     device_x = conn.get_device(1)
     device_x.identify()
     # print(device_x.name)
@@ -84,13 +135,19 @@ def apply_step(conn: Connection, axis, step):
 
     device_rot = conn.get_device(3)
     device_rot.identify()
-    
-    if axis == 0:
-        device_x.get_axis(1).move_relative(step, unit=zaber_units.Units.LENGTH_MILLIMETRES)
-    elif axis == 1:
-        device_y.get_axis(1).move_relative(step, unit=zaber_units.Units.LENGTH_MILLIMETRES)
-    else:
-        device_rot.get_axis(1).move_relative(step, unit=zaber_units.Units.ANGLE_DEGREES)
+
+    _dev  = [device_x, device_y, device_rot][axis]
+    _unit = [zaber_units.Units.LENGTH_MILLIMETRES,
+             zaber_units.Units.LENGTH_MILLIMETRES,
+             zaber_units.Units.ANGLE_DEGREES][axis]
+    _vunit = [zaber_units.Units.VELOCITY_MILLIMETRES_PER_SECOND,
+              zaber_units.Units.VELOCITY_MILLIMETRES_PER_SECOND,
+              zaber_units.Units.ANGULAR_VELOCITY_DEGREES_PER_SECOND][axis]
+    _kw = dict(unit=_unit)
+    if speed and speed > 0:
+        _kw['velocity'] = speed
+        _kw['velocity_unit'] = _vunit
+    _dev.get_axis(1).move_relative(step, **_kw)
     
     return (device_x.get_axis(1).get_position(unit=zaber_units.Units.LENGTH_MILLIMETRES), 
             device_y.get_axis(1).get_position(unit=zaber_units.Units.LENGTH_MILLIMETRES), 
