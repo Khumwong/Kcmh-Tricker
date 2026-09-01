@@ -125,7 +125,7 @@ def load_legacy_schema():
     assert len(rw._plan_mgr.data) == 1
     assert rw._plan_mgr.data[0].get("mode", "treatment") in ("treatment", "", None)
 
-check("Load plan_format_example.csv (26-col schema)", load_full_schema_example)
+check("Load plan_format_example.csv (full schema)", load_full_schema_example)
 check("QA plan row -> QA mode", click_qa_row_switches_mode)
 check("Legacy 19-col plan still loads", load_legacy_schema)
 

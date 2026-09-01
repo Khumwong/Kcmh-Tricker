@@ -107,10 +107,17 @@
   ─── Controller Settings ───
 
   Exposure time (ms)   → เวลาเก็บข้อมูลต่อ 1 loop  (1–100000)
-  Beam delay (ms)      → หน่วงเวลาก่อน trigger / เผื่อบีมมาช้า  (0–255)
+  Beam delay (ms)      → ไบต์ที่ส่งไป FPGA (alpide_delay) — จำกัด 0–255
+                         (byte เดียว เกินนี้ต้องแก้ firmware)
+                         *ไม่* มีผลกับ gate-open window
+  Beam on delay (ms)   → เปิด gate ก่อน exposure เท่านี้ ให้ trigger วิ่ง
+                         รอตอนบีมมาถึง (KCMH lag ~300 ms)
+                         (0–100000, GUI เท่านั้น ไม่มี limit FPGA)
   Beam off delay (ms)  → หลัง exposure จบ ยังเปิด trigger ค้างต่ออีกเท่านี้
                          ก่อนปิด gate แล้วเลื่อน phantom — เผื่อบีมยังไม่ดับสนิท
                          (0–100000, GUI เท่านั้น ไม่ส่งไป FPGA)
+
+  gate-open window ต่อ loop = Beam on delay + Exposure + Beam off delay
   Loops                → จำนวนรอบ (ต้องน้อยกว่า Exposure time)
   Trigger Freq. (Hz)   → ความถี่ readout ALPIDE  (1–95000)
   X step (mm)          → ระยะเลื่อนแกน X ต่อ loop

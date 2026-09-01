@@ -91,6 +91,7 @@ EXPECTED_KEYS = [
     "MU", "current", "Loops", "Trigger Freq. (Hz)",
     "X step (mm)", "Y step (mm)", "R step (degree)",
     "Exposure time (ms)", "Beam delay (ms)",
+    "Beam on delay (ms)", "Beam off delay (ms)",
 ]
 
 def test_all_keys():

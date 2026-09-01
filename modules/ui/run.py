@@ -260,6 +260,7 @@ class RunWidget(QWidget):
             "current": QLineEdit(),
             "Exposure time (ms)": QLineEdit(),
             "Beam delay (ms)": QLineEdit(),
+            "Beam on delay (ms)": QLineEdit(),
             "Beam off delay (ms)": QLineEdit(),
             "Loops": QLineEdit(),
             "Trigger Freq. (Hz)": QLineEdit(),
@@ -272,7 +273,7 @@ class RunWidget(QWidget):
             "num_alpides": "6", "num_events": "30000", "strobe": "100",
             "ithr": "60", "energy": "200", "MU": "1000", "current": "10",
             "Exposure time (ms)": "1000", "Beam delay (ms)": "200",
-            "Beam off delay (ms)": "200", "Loops": "1",
+            "Beam on delay (ms)": "200", "Beam off delay (ms)": "200", "Loops": "1",
             "Trigger Freq. (Hz)": "9500", "X step (mm)": "0",
             "Y step (mm)": "0", "R step (degree)": "0",
         }
@@ -285,7 +286,12 @@ class RunWidget(QWidget):
             "MU": "The monitor unit used for the test: 10 - 10000",
             "current": "The current used for KCMH beam: 4 - 300",
             "Exposure time (ms)": "The total exposure time used for the test: 1 - 100000",
-            "Beam delay (ms)": "The delay beam hit event between phantom translations: 0 - 255",
+            "Beam delay (ms)": ("FPGA trigger delay byte (alpide_delay). Hard limit 0 - 255 "
+                                "(one byte — raising it needs FPGA firmware). Does NOT change "
+                                "the acquisition window; use Beam on delay for that."),
+            "Beam on delay (ms)": ("Gate opens this long BEFORE the exposure so the trigger is "
+                                   "already running when the beam arrives (KCMH turn-on lag "
+                                   "~300 ms). GUI window timing only, no FPGA limit: 0 - 100000"),
             "Beam off delay (ms)": ("Keep the trigger running this long AFTER exposure ends, "
                                     "before closing the gate and moving the phantom — lets ALPIDE "
                                     "confirm the beam is gone. GUI-side window only: 0 - 100000"),
@@ -876,11 +882,12 @@ class RunWidget(QWidget):
         ctrl_fields = [
             ("Exposure time (ms)",  "Exposure time (ms)"),
             ("Beam delay (ms)",     "Beam delay (ms)"),
+            ("Beam on delay (ms)",  "Beam on delay (ms)"),
             ("Beam off delay (ms)", "Beam off delay (ms)"),
             ("Loops",               "Loops"),
-            ("Energy (MeV)",       "energy"),
-            ("MU",                 "MU"),
-            ("Current (nA)",       "current"),
+            ("Energy (MeV)",        "energy"),
+            ("MU",                  "MU"),
+            ("Current (nA)",        "current"),
         ]
         for idx, (display, key) in enumerate(ctrl_fields):
             row, col = divmod(idx, 4)
@@ -2113,7 +2120,7 @@ class RunWidget(QWidget):
         _le = self._line_edits
         print(f"[LAUNCH] {datetime.now().strftime('%H:%M:%S.%f')[:-3]}")
         print(f"  mode={'QA' if self._window._qa_mode else 'Treatment'}")
-        for _k in ["Exposure time (ms)", "Beam delay (ms)", "Beam off delay (ms)", "Loops", "energy", "MU",
+        for _k in ["Exposure time (ms)", "Beam delay (ms)", "Beam on delay (ms)", "Beam off delay (ms)", "Loops", "energy", "MU",
                    "current", "num_alpides", "num_events", "strobe", "ithr"]:
             if _k in _le:
                 print(f"  {_k}={_le[_k].text()}")
@@ -2276,6 +2283,7 @@ class RunWidget(QWidget):
                 _ctrl_fields = [
                     ("Exposure time (ms)", _le.get("Exposure time (ms)", None)),
                     ("Beam delay (ms)",    _le.get("Beam delay (ms)", None)),
+                    ("Beam on delay (ms)",  _le.get("Beam on delay (ms)", None)),
                     ("Beam off delay (ms)", _le.get("Beam off delay (ms)", None)),
                     ("Loops",             _le.get("Loops", None)),
                     ("Trigger Freq. (Hz)",_le.get("Trigger Freq. (Hz)", None)),
@@ -2654,7 +2662,7 @@ class RunWidget(QWidget):
         for w in self._qa_col_widgets:
             w.setVisible(qa)
         # ซ่อนตัวเลขที่ไม่เกี่ยวใน QA mode
-        for key in ["Exposure time (ms)", "Beam delay (ms)", "Beam off delay (ms)", "Loops",
+        for key in ["Exposure time (ms)", "Beam delay (ms)", "Beam on delay (ms)", "Beam off delay (ms)", "Loops",
                     "energy", "MU", "current",
                     "X step (mm)", "Y step (mm)", "R step (degree)"]:
             self._line_edits[key].setVisible(not qa)
@@ -2918,6 +2926,7 @@ class RunWidget(QWidget):
             "current": ["current", list(range(4, 300))],
             "Exposure time (ms)": ["exposure time", list(range(1, 100_000))],
             "Beam delay (ms)": ["beam dalay", list(range(0, 256))],
+            "Beam on delay (ms)": ["beam on delay", list(range(0, 100_000))],
             "Beam off delay (ms)": ["beam off delay", list(range(0, 100_000))],
             "Loops": ["number of loops", list(range(1, 100))],
             "Trigger Freq. (Hz)": ["trigger frequency", list(range(1, 99001))],

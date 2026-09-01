@@ -336,11 +336,13 @@ class RunProgress(QObject):
         self.start_with_thread()
 
     def _window_ms_per_loop(self):
-        """Gate-open time per loop (ms) = Beam delay (beam turn-on lag) + Exposure
-        + Beam off delay (trigger stays running past exposure so ALPIDE can confirm
-        the beam is gone before the gate closes and the phantom steps)."""
+        """Gate-open time per loop (ms) = Beam on delay (front pad for the beam
+        turn-on lag) + Exposure + Beam off delay (trigger stays running past the
+        exposure so ALPIDE can confirm the beam is gone before the gate closes and
+        the phantom steps). NOTE: "Beam delay (ms)" is the FPGA byte only and is
+        deliberately NOT in this window."""
         le = self._window._line_edits
-        return (float(le["Beam delay (ms)"].text() or 0) +
+        return (float(le["Beam on delay (ms)"].text() or 0) +
                 float(le["Exposure time (ms)"].text() or 0) +
                 float(le["Beam off delay (ms)"].text() or 0))
 
